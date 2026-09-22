@@ -9,6 +9,7 @@ NodeTree DEFINITIONS AUTOMATIC TAGS ::= BEGIN
 -- Each element matches a node by its key and, optionally, by its value.
 -- The regexp dialect is left to the implementation; a literal "/" or "="
 -- inside a regexp must be escaped with "\".
+
 NodePointer ::= CHOICE {
     absolute  [0] UTF8String,
     offset    [1] INTEGER
