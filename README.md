@@ -160,6 +160,50 @@ socket (`get_udp_mss()` in [common.py](common.py)): the path MTU via
 fallback where it doesn't (e.g. macOS, which has no UDP equivalent of
 `IP_MTU`/`TCP_MAXSEG`).
 
+### Reconstructing JSON and verifying the round trip
+
+`client.py --json` collects every batch of a query (following every
+continuation, however many it takes) and reconstructs a JSON value from
+the resulting nodes — the inverse of the JSON -> Node derivation in
+[demo_data.py](demo_data.py). Query `.*` to reconstruct the whole tree:
+
+```bash
+python3 client.py ".*" --json
+```
+
+`--compare` (which implies `--json`) additionally diffs that against a
+reference JSON file, `demo_data.json` by default — a round-trip check
+that what the server actually sent over the wire (however many
+datagrams it took) reconstructs back to the source data:
+
+```bash
+python3 client.py ".*" --compare
+# or, since --json/--compare default the expression to ".*":
+python3 client.py --compare
+```
+
+```
+MATCH: reconstructed JSON == demo_data.json (after stringifying its scalars -- the wire format carries no type tag)
+```
+
+This works even when the server had to split the response across many
+datagrams — try it with `--mss 45` on the server, forcing a dozen-plus
+round trips, and it still reconstructs and matches correctly.
+
+Two things are worth knowing about the comparison:
+
+- **The wire format has no type tag.** A `Node`'s `value` is an opaque
+  `OCTET STRING`; a JSON number like `30` and the string `"30"` are
+  indistinguishable once encoded. `--compare` accounts for this by
+  stringifying the reference JSON's scalars the same way before
+  diffing (`canonicalize_json_types()` in [common.py](common.py)), so
+  a MISMATCH means an actual structural or value difference, not just
+  a type difference.
+- **A single-element array round-trips as a plain property**, since
+  "this key occurred once" is all a flattened sibling list can convey
+  — a real, inherent limitation of the derivation, not a bug (it
+  doesn't affect the demo data: `users` always has 3 elements).
+
 ## On-the-wire packets
 
 Both programs take `--pcap`, which prints a `tcpdump -X`-style hex dump
@@ -236,8 +280,8 @@ sudo tcpdump -i lo0 -n udp port 8514 -w nodetree.pcap
 | File | Purpose |
 |---|---|
 | [node.asn](node.asn) | ASN.1 schema: `Node`, `NodePointer`, `Get`, `Response` |
-| [common.py](common.py) | BER encode/decode, MSS discovery, expression parsing/matching, tree flattening, MSS-fit truncation, pcap-style dump formatting |
+| [common.py](common.py) | BER encode/decode, MSS discovery, expression parsing/matching, tree flattening, MSS-fit truncation, JSON reconstruction, pcap-style dump formatting |
 | [demo_data.json](demo_data.json) | Sample data, as plain JSON |
 | [demo_data.py](demo_data.py) | Derives the in-memory `Node` tree from `demo_data.json`'s structure and attribute names |
 | [server.py](server.py) | UDP server: resolves `Get` requests against the demo tree |
-| [client.py](client.py) | UDP client: sends a `Get`, follows continuation pointers, prints the result |
+| [client.py](client.py) | UDP client: sends a `Get`, follows continuation pointers, prints the result; `--json`/`--compare` reconstruct JSON and verify it against a reference file |

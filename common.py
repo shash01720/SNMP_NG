@@ -309,3 +309,97 @@ def _fixup_window(wire_nodes, resume_index, n, base_expression):
             if target_global >= end_global:
                 node[field] = ("absolute", f"{base_expression}@{target_global}")
     return included
+
+
+# --- reconstructing JSON from a fully-resolved flat node array -----------
+#
+# The client (see client.py --json/--compare) gathers every batch of a
+# query -- following every continuation -- into `combined`: a dict
+# mapping global flattened index -> wire node, with every firstChild/
+# nextSibling now a plain in-range offset (no leftover absolute
+# continuation pointers). unflatten() rebuilds real nested (key, value,
+# children) node objects from that; reconstruct_json() then inverts
+# demo_data.py's JSON -> Node derivation.
+
+def unflatten(combined):
+    """Rebuild nested node objects from `combined`. Returns the list of
+    top-level sibling nodes (the chain starting at global index 0).
+
+    A pointer here is either a plain ("offset", delta) -- resolved by
+    arithmetic against its own index -- or a leftover ("absolute",
+    "<base>@<target_idx>") continuation pointer that was never replaced
+    with its resolved offset after fetching; that target_idx *is* the
+    target's global index directly, so it's used as-is (as long as that
+    index was actually fetched into `combined`)."""
+
+    def resolve_target(idx, pointer):
+        ptr_type, ptr_value = pointer
+        if ptr_type == "offset":
+            return idx + ptr_value if ptr_value != 0 else None
+        _, target_idx = split_resume_suffix(ptr_value)
+        if target_idx not in combined:
+            raise ValueError(f"node {idx}: continuation target {target_idx} was never fetched")
+        return target_idx
+
+    def build(idx):
+        wire = combined[idx]
+        child_start = resolve_target(idx, wire["firstChild"])
+        children = walk_siblings(child_start) if child_start is not None else []
+        return {"key": wire["key"], "value": bytes(wire["value"]), "children": children}
+
+    def walk_siblings(start):
+        nodes = []
+        idx = start
+        while idx is not None:
+            nodes.append(build(idx))
+            idx = resolve_target(idx, combined[idx]["nextSibling"])
+        return nodes
+
+    return walk_siblings(0) if combined else []
+
+
+def reconstruct_json(nodes):
+    """Invert demo_data.py's JSON -> Node derivation over a list of
+    sibling node objects (as produced by unflatten(), or a node's own
+    "children"): a key occurring once becomes a plain property; a key
+    occurring more than once becomes a JSON array -- the mirror image
+    of an array of elements becoming repeated sibling nodes there.
+
+    Every leaf value comes back as a *string*: the wire format's OCTET
+    STRING carries no type tag, so a JSON number/boolean/null that went
+    in comes back as its string form, not its original type. Use
+    canonicalize_json_types() on a real JSON source before comparing it
+    against this function's output.
+
+    Also not recoverable: an array with exactly one element is
+    indistinguishable from a plain scalar/object property (both look
+    like "this key occurred once").
+    """
+    groups = {}
+    order = []
+    for node in nodes:
+        key = node["key"]
+        if node["children"]:
+            value = reconstruct_json(node["children"])
+        else:
+            value = node["value"].decode("utf-8", "replace")
+        if key not in groups:
+            groups[key] = []
+            order.append(key)
+        groups[key].append(value)
+    return {key: (groups[key][0] if len(groups[key]) == 1 else groups[key]) for key in order}
+
+
+def canonicalize_json_types(value):
+    """Recursively stringify scalars the way the Node wire format does
+    (see reconstruct_json's docstring), so a real JSON source can be
+    compared against reconstructed output on equal terms."""
+    if isinstance(value, dict):
+        return {k: canonicalize_json_types(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [canonicalize_json_types(v) for v in value]
+    if value is None:
+        return ""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    return str(value)
