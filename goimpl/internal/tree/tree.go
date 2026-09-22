@@ -1,0 +1,467 @@
+// Package tree is the in-memory Node tree: construction, the NodePointer
+// match-expression parser/evaluator, and flattening a match into wire.Node
+// values with offset pointers -- a direct port of the design proven out in
+// the repo's Python reference implementation (common.py), adapted for
+// wire.NodeValue instead of a bare byte string.
+package tree
+
+import (
+	"fmt"
+	"regexp"
+	"strconv"
+	"strings"
+	"sync"
+
+	"github.com/shashi/snmp-ng/goimpl/internal/wire"
+)
+
+// Node is a tree node with real child pointers (unlike wire.Node, which
+// only carries offset/absolute pointers for the wire).
+type Node struct {
+	Key      string
+	Value    wire.NodeValue
+	Children []*Node
+	Parent   *Node
+}
+
+// Tree is a Node tree guarded by a single mutex -- simple and sufficient
+// for this reference implementation's traffic volumes; a real deployment
+// with heavy concurrent Query/Set traffic would want finer-grained locking.
+type Tree struct {
+	mu   sync.RWMutex
+	Root *Node
+}
+
+func New() *Tree {
+	return &Tree{Root: &Node{Key: "/", Value: wire.NoValue()}}
+}
+
+// AppendChild adds `child` as parent's last child, fixing up Parent.
+func AppendChild(parent, child *Node) {
+	child.Parent = parent
+	parent.Children = append(parent.Children, child)
+}
+
+// --- match-expression parsing (identical grammar to the Python reference) -
+//
+//	request    = expression ["@" resume-index]
+//	expression = 1*( ["/"] key-regexp ["=" value-regexp] )
+//
+// "/" separates segments (a leading one is optional/ignored); "=" separates
+// a segment's key regexp from its optional value regexp; "@" (at the very
+// end) names a resume index. A literal "/", "=" or "@" inside a regexp is
+// written "\/", "\=", "\@".
+
+type Segment struct {
+	KeyRe   *regexp.Regexp
+	ValueRe *regexp.Regexp // nil if this segment has no value predicate
+}
+
+func ParseExpression(expression string) ([]Segment, error) {
+	var segments []Segment
+	for _, part := range splitUnescaped(expression, '/') {
+		if part == "" {
+			continue
+		}
+		keyRaw, hasValue, valueRaw := splitFirstUnescaped(part, '=')
+		keyRe, err := regexp.Compile("^(?:" + keyRaw + ")$")
+		if err != nil {
+			return nil, fmt.Errorf("bad key regexp %q: %w", keyRaw, err)
+		}
+		var valueRe *regexp.Regexp
+		if hasValue {
+			valueRe, err = regexp.Compile("^(?:" + valueRaw + ")$")
+			if err != nil {
+				return nil, fmt.Errorf("bad value regexp %q: %w", valueRaw, err)
+			}
+		}
+		segments = append(segments, Segment{KeyRe: keyRe, ValueRe: valueRe})
+	}
+	if len(segments) == 0 {
+		return nil, fmt.Errorf("empty NodePointer expression")
+	}
+	return segments, nil
+}
+
+// SplitResumeSuffix splits "expression@index" into (expression, index); a
+// missing or non-numeric suffix yields (raw, 0).
+func SplitResumeSuffix(raw string) (string, int) {
+	before, found, after := splitFirstUnescaped(raw, '@')
+	if found {
+		if n, err := strconv.Atoi(after); err == nil {
+			return before, n
+		}
+	}
+	return raw, 0
+}
+
+func splitUnescaped(s string, delim byte) []string {
+	var parts []string
+	var buf strings.Builder
+	i := 0
+	for i < len(s) {
+		c := s[i]
+		if c == '\\' && i+1 < len(s) && (s[i+1] == delim || s[i+1] == '\\') {
+			buf.WriteByte(s[i+1])
+			i += 2
+			continue
+		}
+		if c == delim {
+			parts = append(parts, buf.String())
+			buf.Reset()
+			i++
+			continue
+		}
+		buf.WriteByte(c)
+		i++
+	}
+	parts = append(parts, buf.String())
+	return parts
+}
+
+func splitFirstUnescaped(s string, delim byte) (before string, found bool, after string) {
+	var buf strings.Builder
+	i := 0
+	for i < len(s) {
+		c := s[i]
+		if c == '\\' && i+1 < len(s) && (s[i+1] == delim || s[i+1] == '\\') {
+			buf.WriteByte(s[i+1])
+			i += 2
+			continue
+		}
+		if c == delim {
+			return buf.String(), true, s[i+1:]
+		}
+		buf.WriteByte(c)
+		i++
+	}
+	return buf.String(), false, ""
+}
+
+// --- evaluation --------------------------------------------------------
+
+// Evaluate walks root's children matching each segment in turn, returning
+// the nodes matched by the final segment. Caller must hold at least a read
+// lock on the owning Tree.
+func Evaluate(root *Node, segments []Segment) []*Node {
+	current := []*Node{root}
+	for _, seg := range segments {
+		var next []*Node
+		for _, node := range current {
+			for _, child := range node.Children {
+				if !seg.KeyRe.MatchString(child.Key) {
+					continue
+				}
+				if seg.ValueRe != nil {
+					if !child.Value.Kind.IsNumeric() && child.Value.Kind != wire.ValueOctetString {
+						continue
+					}
+					if !seg.ValueRe.MatchString(valueAsText(child.Value)) {
+						continue
+					}
+				}
+				next = append(next, child)
+			}
+		}
+		current = next
+	}
+	return current
+}
+
+// EvaluateExactlyOne is a convenience for Set's target resolution, which
+// must resolve to exactly one node.
+func EvaluateExactlyOne(root *Node, segments []Segment) (*Node, error) {
+	matches := Evaluate(root, segments)
+	switch len(matches) {
+	case 0:
+		return nil, fmt.Errorf("no node matched")
+	case 1:
+		return matches[0], nil
+	default:
+		return nil, fmt.Errorf("expression matched %d nodes, expected exactly 1", len(matches))
+	}
+}
+
+func valueAsText(v wire.NodeValue) string {
+	switch v.Kind {
+	case wire.ValueOctetString:
+		return string(v.OctetString)
+	case wire.ValueInteger32:
+		return strconv.FormatInt(int64(v.Integer32), 10)
+	case wire.ValueUnsigned32:
+		return strconv.FormatUint(uint64(v.Unsigned32), 10)
+	case wire.ValueCounter32:
+		return strconv.FormatUint(uint64(v.Counter32), 10)
+	case wire.ValueCounter64:
+		return strconv.FormatUint(v.Counter64, 10)
+	case wire.ValueTimeTicks:
+		return strconv.FormatUint(uint64(v.TimeTicks), 10)
+	case wire.ValueReal:
+		return strconv.FormatFloat(v.Real, 'g', -1, 64)
+	default:
+		return ""
+	}
+}
+
+// --- flattening into wire.Node with offset pointers ---------------------
+//
+// Each matched node's whole subtree is flattened pre-order; multiple
+// top-level matches are then chained to each other via nextSibling (even
+// though they usually aren't real tree-siblings), so a later match that
+// doesn't fit a size budget still gets a continuation instead of silently
+// vanishing -- exactly the design proven out in the Python reference
+// implementation's common.py.
+
+func FlattenMatches(matches []*Node) []wire.Node {
+	var out []wire.Node
+	var blockStarts []int
+	for _, m := range matches {
+		blockStarts = append(blockStarts, len(out))
+		out = append(out, flattenSubtree(m)...)
+	}
+	for i := 0; i < len(blockStarts)-1; i++ {
+		rootIdx := blockStarts[i]
+		nextRootIdx := blockStarts[i+1]
+		out[rootIdx].NextSibling = wire.OffsetPointer(int64(nextRootIdx - rootIdx))
+	}
+	return out
+}
+
+func flattenSubtree(root *Node) []wire.Node {
+	var order []*Node
+	parentOf := map[*Node]*Node{}
+	siblingIndex := map[*Node]int{}
+
+	var visit func(n, parent *Node)
+	visit = func(n, parent *Node) {
+		order = append(order, n)
+		parentOf[n] = parent
+		for i, c := range n.Children {
+			siblingIndex[c] = i
+		}
+		for _, c := range n.Children {
+			visit(c, n)
+		}
+	}
+	visit(root, nil)
+
+	indexOf := map[*Node]int{}
+	for i, n := range order {
+		indexOf[n] = i
+	}
+
+	wireNodes := make([]wire.Node, len(order))
+	for i, n := range order {
+		firstChild := wire.OffsetPointer(0)
+		if len(n.Children) > 0 {
+			firstChild = wire.OffsetPointer(int64(indexOf[n.Children[0]] - i))
+		}
+		nextSibling := wire.OffsetPointer(0)
+		if parent := parentOf[n]; parent != nil {
+			pos := siblingIndex[n]
+			if pos+1 < len(parent.Children) {
+				nextSibling = wire.OffsetPointer(int64(indexOf[parent.Children[pos+1]] - i))
+			}
+		}
+		wireNodes[i] = wire.Node{Key: n.Key, Value: n.Value, FirstChild: firstChild, NextSibling: nextSibling}
+	}
+	return wireNodes
+}
+
+// --- Tree-level convenience wrappers (locking) ----------------------------
+
+func (t *Tree) Get(expression string) ([]wire.Node, error) {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	base, resume := SplitResumeSuffix(expression)
+	segments, err := ParseExpression(base)
+	if err != nil {
+		return nil, err
+	}
+	matches := Evaluate(t.Root, segments)
+	flat := FlattenMatches(matches)
+	if resume < 0 || resume > len(flat) {
+		return nil, fmt.Errorf("resume index %d out of range for %d node(s)", resume, len(flat))
+	}
+	return flat[resume:], nil
+}
+
+// FindOne resolves `expression` to exactly one live tree Node (for Set's
+// target). Does not accept a resume ("@index") suffix -- that's a Get/Query
+// pagination concept, not meaningful for identifying a single node to
+// mutate.
+func (t *Tree) FindOne(expression string) (*Node, error) {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	segments, err := ParseExpression(expression)
+	if err != nil {
+		return nil, err
+	}
+	return EvaluateExactlyOne(t.Root, segments)
+}
+
+// FindAll resolves `expression` to every currently-matching live tree Node
+// (for Query's sampling, which reads the same expression repeatedly).
+func (t *Tree) FindAll(expression string) ([]*Node, error) {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	segments, err := ParseExpression(expression)
+	if err != nil {
+		return nil, err
+	}
+	return Evaluate(t.Root, segments), nil
+}
+
+// EnsurePath walks (creating as needed) a chain of container nodes
+// key1/key2/... under the tree root, returning the final node. Used to
+// materialize the "/Sessions/Connection-ID=<id>/..." virtual subtrees.
+// Each path element is matched/created literally (not as a regexp).
+func (t *Tree) EnsurePath(keys ...string) *Node {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.ensurePathLocked(t.Root, keys)
+}
+
+// EnsurePath0 is EnsurePath starting from an already-resolved node
+// (typically one returned by an earlier EnsurePath/EnsurePath0 call)
+// instead of the tree root.
+func (t *Tree) EnsurePath0(start *Node, keys ...string) *Node {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.ensurePathLocked(start, keys)
+}
+
+func (t *Tree) ensurePathLocked(start *Node, keys []string) *Node {
+	cur := start
+	for _, key := range keys {
+		var found *Node
+		for _, c := range cur.Children {
+			if c.Key == key {
+				found = c
+				break
+			}
+		}
+		if found == nil {
+			found = &Node{Key: key, Value: wire.NoValue()}
+			AppendChild(cur, found)
+		}
+		cur = found
+	}
+	return cur
+}
+
+// AppendUnder appends a new child node under `parent` (already resolved via
+// EnsurePath/FindOne), returning it. Used by Create and by error/query-
+// result node generation.
+func (t *Tree) AppendUnder(parent *Node, key string, value wire.NodeValue) *Node {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	n := &Node{Key: key, Value: value}
+	AppendChild(parent, n)
+	return n
+}
+
+// Set applies a Set request to the tree: target must resolve to exactly one
+// node; each of newValue/newFirstChild/newNextSibling is applied if
+// non-nil. newFirstChild/newNextSibling name a target node by absolute
+// expression (resolved the same way Set.target is) or clear the pointer
+// (wire.NonePointer()) -- an offset pointer is invalid input from a client
+// and rejected, since offsets are only meaningful inside a server-generated
+// flattened Response.
+func (t *Tree) Set(s *wire.Set) error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	target, err := t.resolveOneLocked(s.Target)
+	if err != nil {
+		return fmt.Errorf("target: %w", err)
+	}
+
+	if s.NewValue != nil {
+		target.Value = *s.NewValue
+	}
+
+	if s.NewFirstChild != nil {
+		newChild, err := t.resolvePointerAsChildLocked(*s.NewFirstChild)
+		if err != nil {
+			return fmt.Errorf("newFirstChild: %w", err)
+		}
+		if err := relinkFirstChild(target, newChild); err != nil {
+			return fmt.Errorf("newFirstChild: %w", err)
+		}
+	}
+	if s.NewNextSibling != nil {
+		newSibling, err := t.resolvePointerAsChildLocked(*s.NewNextSibling)
+		if err != nil {
+			return fmt.Errorf("newNextSibling: %w", err)
+		}
+		if err := relinkNextSibling(target, newSibling); err != nil {
+			return fmt.Errorf("newNextSibling: %w", err)
+		}
+	}
+	return nil
+}
+
+func (t *Tree) resolveOneLocked(p wire.NodePointer) (*Node, error) {
+	if p.Kind != wire.PointerAbsolute {
+		return nil, fmt.Errorf("must be an absolute expression, not an offset")
+	}
+	segments, err := ParseExpression(p.Absolute)
+	if err != nil {
+		return nil, err
+	}
+	return EvaluateExactlyOne(t.Root, segments)
+}
+
+// resolvePointerAsChildLocked resolves a NewFirstChild/NewNextSibling value:
+// PointerNone means "detach" (nil), PointerAbsolute names the node to point
+// to (which must be an existing sibling of the relevant list -- reparenting
+// across parents is out of scope for this Set message, matching the
+// "delete by relinking" use case node.asn documents, not general tree
+// surgery).
+func (t *Tree) resolvePointerAsChildLocked(p wire.NodePointer) (*Node, error) {
+	if p.Kind == wire.PointerNone {
+		return nil, nil
+	}
+	return t.resolveOneLocked(p)
+}
+
+func relinkFirstChild(parent, newFirstChild *Node) error {
+	if newFirstChild == nil {
+		parent.Children = nil
+		return nil
+	}
+	if newFirstChild.Parent != parent {
+		return fmt.Errorf("%q is not a child of the target node", newFirstChild.Key)
+	}
+	idx := indexOfChild(parent, newFirstChild)
+	parent.Children = parent.Children[idx:]
+	return nil
+}
+
+func relinkNextSibling(node, newNextSibling *Node) error {
+	parent := node.Parent
+	if parent == nil {
+		return fmt.Errorf("target node has no parent (it is the root)")
+	}
+	idx := indexOfChild(parent, node)
+	if newNextSibling == nil {
+		parent.Children = parent.Children[:idx+1]
+		return nil
+	}
+	if newNextSibling.Parent != parent {
+		return fmt.Errorf("%q is not a sibling of the target node", newNextSibling.Key)
+	}
+	newIdx := indexOfChild(parent, newNextSibling)
+	parent.Children = append(parent.Children[:idx+1:idx+1], parent.Children[newIdx:]...)
+	return nil
+}
+
+func indexOfChild(parent, child *Node) int {
+	for i, c := range parent.Children {
+		if c == child {
+			return i
+		}
+	}
+	return -1
+}

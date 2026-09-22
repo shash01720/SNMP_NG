@@ -1,0 +1,94 @@
+{
+  "NodeValue_integer32": {
+    "type": "NodeValue",
+    "hex": "8001d6"
+  },
+  "NodeValue_unsigned32": {
+    "type": "NodeValue",
+    "hex": "81012a"
+  },
+  "NodeValue_counter64": {
+    "type": "NodeValue",
+    "hex": "830900f9ccd8a1c5080000"
+  },
+  "NodeValue_octetString": {
+    "type": "NodeValue",
+    "hex": "850568656c6c6f"
+  },
+  "NodeValue_real": {
+    "type": "NodeValue",
+    "hex": "8608400921f9f01b866e"
+  },
+  "NodeValue_noValue": {
+    "type": "NodeValue",
+    "hex": "8700"
+  },
+  "NodePointer_none": {
+    "type": "NodePointer",
+    "hex": "8200"
+  },
+  "NodePointer_absolute": {
+    "type": "NodePointer",
+    "hex": "80062f7573657273"
+  },
+  "NodePointer_offset": {
+    "type": "NodePointer",
+    "hex": "810105"
+  },
+  "Node_alice": {
+    "type": "Node",
+    "hex": "30198005616c696365a107850561646d696ea2028200a303810101"
+  },
+  "Get_1": {
+    "type": "Get",
+    "hex": "300d800101a10880062f7573657273"
+  },
+  "Set_1": {
+    "type": "Set",
+    "hex": "3024800102a11380112f75736572732f757365723d616c696365a2068504726f6f74a3028200"
+  },
+  "Create_1": {
+    "type": "Create",
+    "hex": "300f80010381046e6f7465a20485026869"
+  },
+  "Create_2": {
+    "type": "Create",
+    "hex": "300e8001048109636f6e7461696e6572"
+  },
+  "AggregationMethod_percentile": {
+    "type": "AggregationMethod",
+    "hex": "84015f"
+  },
+  "AggregationMethod_mean": {
+    "type": "AggregationMethod",
+    "hex": "8200"
+  },
+  "Query_1": {
+    "type": "Query",
+    "hex": "3024800105810f2f636f6e6669672f74696d656f75748202012c83020258a402820085021770"
+  },
+  "Query_once": {
+    "type": "Query",
+    "hex": "301a800106810f2f636f6e6669672f74696d656f7574820100850100"
+  },
+  "Response_ok": {
+    "type": "Response",
+    "hex": "3026800107810101820100a41b30198005616c696365a107850561646d696ea2028200a303810101"
+  },
+  "Response_error": {
+    "type": "Response",
+    "hex": "303d8001088101028201ffa330802e2f53657373696f6e732f436f6e6e656374696f6e2d49445c3d6162632f4572726f72732f4e6f537563684e6f6465a400"
+  },
+  "SummaryAck_1": {
+    "type": "SummaryAck",
+    "hex": "3012a01030068001008101053006800108810108"
+  },
+  "NodeTreeMessage_get": {
+    "type": "NodeTreeMessage",
+    "hex": "a00d800101a10880062f7573657273"
+  },
+  "NodeTreeMessage_summaryAck": {
+    "type": "NodeTreeMessage",
+    "hex": "a50aa0083006800100810103"
+  }
+}
