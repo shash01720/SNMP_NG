@@ -3,10 +3,12 @@
 Wire format: each message is a single UDP datagram containing the BER
 encoding of a `Get` or `Response` value from node.asn. UDP preserves
 datagram boundaries, so no length prefix is needed -- but a `Response`
-that would exceed MAX_DATAGRAM_SIZE cannot be sent (see server.py).
+that doesn't fit in one datagram (see MSS below) has to be split, with
+continuation NodePointers, rather than sent as one oversized packet.
 """
 from pathlib import Path
 import re
+import socket
 
 import asn1tools
 
@@ -20,6 +22,13 @@ DEFAULT_PORT = 8514
 # safely under the 65507-byte theoretical max for IPv4).
 MAX_DATAGRAM_SIZE = 65507
 
+IP_HEADER_SIZE = 20   # IPv4 header, no options
+UDP_HEADER_SIZE = 8
+
+# Used when the OS can't tell us a path MTU (see get_udp_mss): the
+# ordinary Ethernet MTU, which is a reasonable, widely-safe assumption.
+FALLBACK_MTU = 1500
+
 
 # --- framing -----------------------------------------------------------
 
@@ -29,6 +38,37 @@ def encode_message(type_name, value):
 
 def decode_message(type_name, data):
     return SPEC.decode(type_name, data)
+
+
+# --- MSS discovery ---------------------------------------------------------
+#
+# UDP has no MSS concept the way TCP does (there's no TCP_MAXSEG
+# equivalent) -- the closest analogue is the path MTU minus the IP and
+# UDP header sizes. Linux exposes the current path MTU for a connected
+# socket via getsockopt(IPPROTO_IP, IP_MTU); most other platforms
+# (including macOS) don't expose it via the socket API at all, so this
+# falls back to FALLBACK_MTU on those.
+
+def get_udp_mss(peer_addr):
+    """Best-effort maximum Response payload size (bytes) for a peer."""
+    mtu = None
+    ip_mtu = getattr(socket, "IP_MTU", None)
+    if ip_mtu is not None:
+        family = socket.AF_INET6 if ":" in peer_addr[0] else socket.AF_INET
+        probe = socket.socket(family, socket.SOCK_DGRAM)
+        try:
+            probe.connect(peer_addr)
+            mtu = probe.getsockopt(socket.IPPROTO_IP, ip_mtu)
+        except OSError:
+            mtu = None
+        finally:
+            probe.close()
+
+    if not mtu:
+        mtu = FALLBACK_MTU
+
+    mss = mtu - IP_HEADER_SIZE - UDP_HEADER_SIZE
+    return max(min(mss, MAX_DATAGRAM_SIZE), 0)
 
 
 # --- NodePointer match-expression parsing -------------------------------
@@ -96,6 +136,19 @@ def _split_first_unescaped(s, delim):
     return buf, False, ""
 
 
+# A request is `expression ["@" resume-index]`: the optional suffix names
+# a zero-based index into `expression`'s own full, deterministic
+# flattened result to resume from (used for continuations -- see
+# build_response_for_mss). A literal "@" inside a regexp must be written
+# "\@", same as "/" and "=".
+
+def split_resume_suffix(raw_expression):
+    before, found, after = _split_first_unescaped(raw_expression, "@")
+    if found and after.isdigit():
+        return before, int(after)
+    return raw_expression, 0
+
+
 # --- tree evaluation -----------------------------------------------------
 
 def evaluate_pointer(root, segments):
@@ -124,15 +177,29 @@ def evaluate_pointer(root, segments):
 # firstChild/nextSibling become offset NodePointers: the signed distance
 # (in list positions) to the target Node. An offset of 0 is a sentinel
 # meaning "no child" / "no next sibling" (a self-referencing offset is
-# otherwise meaningless). Separate matches are flattened independently
-# and never linked to each other, even if they happen to be siblings in
-# the source tree.
+# otherwise meaningless).
+#
+# When an expression matches more than one top-level node (e.g. a
+# wildcard key regexp), each match's own subtree is flattened
+# independently and the match roots are then chained to each other via
+# nextSibling, in match order -- even though they usually aren't real
+# tree-siblings. Without this, a later match that gets left out by MSS
+# truncation would have nothing pointing to it and would just silently
+# go missing from the response instead of getting a continuation.
 
 def flatten_matches(matches):
-    result = []
+    wire_nodes = []
+    block_starts = []
     for match in matches:
-        result.extend(_flatten_subtree(match))
-    return result
+        block_starts.append(len(wire_nodes))
+        wire_nodes.extend(_flatten_subtree(match))
+
+    for i in range(len(block_starts) - 1):
+        root_index = block_starts[i]
+        next_root_index = block_starts[i + 1]
+        wire_nodes[root_index]["nextSibling"] = ("offset", next_root_index - root_index)
+
+    return wire_nodes
 
 
 def _flatten_subtree(root):
@@ -173,3 +240,49 @@ def _flatten_subtree(root):
             "nextSibling": ("offset", next_sibling_offset),
         })
     return wire_nodes
+
+
+# --- fitting a Response into MSS bytes ------------------------------------
+#
+# `wire_nodes` is `base_expression`'s full, deterministic flatten -- the
+# server recomputes exactly the same array on every request for the same
+# base_expression, so a *position* in it (a resume index) is a stable,
+# stateless cursor; nothing needs to be remembered between requests.
+#
+# Offsets are deltas (target index - current index) so they stay valid
+# wherever a contiguous run of them ends up, but a node included in this
+# response can point past the window actually sent. When that happens,
+# that field is rewritten from an offset to an absolute continuation
+# NodePointer: `base_expression@target_index`. Resuming there replays the
+# same flatten and continues from exactly that position, so later
+# siblings/children stay reachable across as many continuations as it
+# takes -- unlike pointing at the target node alone, which would lose
+# its siblings by re-matching it as a fresh, independent query.
+
+def build_response_for_mss(wire_nodes, resume_index, mss, base_expression):
+    """Return (response, truncated): the largest run of
+    wire_nodes[resume_index:] (with dangling offsets rewritten to
+    absolute continuation pointers) whose Response encoding fits in
+    `mss` bytes."""
+    window_total = len(wire_nodes) - resume_index
+    for n in range(window_total, 0, -1):
+        candidate = _fixup_window(wire_nodes, resume_index, n, base_expression)
+        encoded = encode_message("Response", candidate)
+        if len(encoded) <= mss:
+            return candidate, n < window_total
+    return [], window_total > 0
+
+
+def _fixup_window(wire_nodes, resume_index, n, base_expression):
+    end_global = resume_index + n
+    included = [dict(node) for node in wire_nodes[resume_index:end_global]]
+    for j, node in enumerate(included):
+        i_global = resume_index + j
+        for field in ("firstChild", "nextSibling"):
+            ptr_type, offset = node[field]
+            if ptr_type != "offset" or offset == 0:
+                continue  # not a pointer, or the "none" sentinel
+            target_global = i_global + offset
+            if target_global >= end_global:
+                node[field] = ("absolute", f"{base_expression}@{target_global}")
+    return included

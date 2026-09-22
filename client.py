@@ -2,7 +2,11 @@
 """Reference client for the NodeTree GET protocol (see node.asn).
 
 Sends a `Get` datagram for the given NodePointer match expression over
-UDP and prints the resulting `Response`.
+UDP and prints the resulting `Response`. If a node's firstChild or
+nextSibling comes back as an absolute NodePointer (rather than an
+offset), that means the server's answer was too big for one datagram
+and the pointer is a continuation: this client automatically issues a
+follow-up Get for it and keeps going until no continuations remain.
 """
 import argparse
 import socket
@@ -16,6 +20,33 @@ from common import (
 )
 
 TIMEOUT_SECONDS = 5.0
+MAX_FOLLOWUPS = 50  # loop guard against a cyclic/misbehaving server
+
+
+def send_get(sock, addr, expression, timeout):
+    request = encode_message("Get", {"target": ("absolute", expression)})
+    sock.settimeout(timeout)
+    sock.sendto(request, addr)
+    try:
+        data, _ = sock.recvfrom(MAX_DATAGRAM_SIZE)
+    except socket.timeout:
+        return None
+    return decode_message("Response", data)
+
+
+def print_batch(label, response):
+    print(f"-- {label} ({len(response)} node(s)) --")
+    for node in response:
+        _, fc = node["firstChild"]
+        _, ns = node["nextSibling"]
+        fc_type, _ = node["firstChild"]
+        ns_type, _ = node["nextSibling"]
+        fc_str = "none" if (fc_type == "offset" and fc == 0) else (
+            f"+{fc}" if fc_type == "offset" else f"-> {fc!r}")
+        ns_str = "none" if (ns_type == "offset" and ns == 0) else (
+            f"+{ns}" if ns_type == "offset" else f"-> {ns!r}")
+        print(f"    key={node['key']!r} value={bytes(node['value'])!r} "
+              f"firstChild={fc_str} nextSibling={ns_str}")
 
 
 def main():
@@ -25,34 +56,46 @@ def main():
     parser.add_argument("--port", type=int, default=DEFAULT_PORT)
     parser.add_argument("--timeout", type=float, default=TIMEOUT_SECONDS)
     args = parser.parse_args()
-
-    request = encode_message("Get", {"target": ("absolute", args.expression)})
+    addr = (args.host, args.port)
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock.settimeout(args.timeout)
     try:
-        sock.sendto(request, (args.host, args.port))
-        try:
-            data, _ = sock.recvfrom(MAX_DATAGRAM_SIZE)
-        except socket.timeout:
-            print(f"(no reply from {args.host}:{args.port} within {args.timeout}s)")
-            return
+        seen = {args.expression}
+        queue = [args.expression]
+        total_nodes = 0
+        followups = 0
+
+        while queue:
+            expression = queue.pop(0)
+            response = send_get(sock, addr, expression, args.timeout)
+            if response is None:
+                print(f"(no reply for {expression!r} from "
+                      f"{args.host}:{args.port} within {args.timeout}s)")
+                continue
+
+            label = "response" if expression == args.expression else f"continuation of {expression!r}"
+            print_batch(label, response)
+            total_nodes += len(response)
+
+            for node in response:
+                for field in ("firstChild", "nextSibling"):
+                    ptr_type, ptr_value = node[field]
+                    if ptr_type != "absolute":
+                        continue
+                    if ptr_value in seen:
+                        continue
+                    if followups >= MAX_FOLLOWUPS:
+                        print(f"(hit MAX_FOLLOWUPS={MAX_FOLLOWUPS}, not "
+                              f"following {ptr_value!r})")
+                        continue
+                    seen.add(ptr_value)
+                    queue.append(ptr_value)
+                    followups += 1
+
+        if total_nodes == 0:
+            print("(no matches)")
     finally:
         sock.close()
-
-    response = decode_message("Response", data)
-
-    if not response:
-        print("(no matches)")
-        return
-
-    for i, node in enumerate(response):
-        _, fc_offset = node["firstChild"]
-        _, ns_offset = node["nextSibling"]
-        fc = "none" if fc_offset == 0 else f"+{fc_offset}"
-        ns = "none" if ns_offset == 0 else f"+{ns_offset}"
-        print(f"[{i}] key={node['key']!r} value={bytes(node['value'])!r} "
-              f"firstChild={fc} nextSibling={ns}")
 
 
 if __name__ == "__main__":
