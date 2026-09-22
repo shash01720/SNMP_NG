@@ -1,0 +1,30 @@
+NodeTree DEFINITIONS AUTOMATIC TAGS ::= BEGIN
+
+-- The context tag is the pointer type: 0 = absolute, 1 = offset.
+--
+-- An absolute pointer is a UTF8String holding a match expression:
+--
+--     expression = 1*( [ "/" ] key-regexp [ "=" value-regexp ] )
+--
+-- Each element matches a node by its key and, optionally, by its value.
+-- The regexp dialect is left to the implementation; a literal "/" or "="
+-- inside a regexp must be escaped with "\".
+NodePointer ::= CHOICE {
+    absolute  [0] UTF8String,
+    offset    [1] INTEGER
+}
+
+Node ::= SEQUENCE {
+    key          UTF8String,
+    value        OCTET STRING,   -- opaque data
+    firstChild   NodePointer,
+    nextSibling  NodePointer
+}
+
+Get ::= SEQUENCE {
+    target  NodePointer
+}
+
+Response ::= SEQUENCE OF Node
+
+END
