@@ -1,31 +1,264 @@
 NodeTree DEFINITIONS AUTOMATIC TAGS ::= BEGIN
 
--- The context tag is the pointer type: 0 = absolute, 1 = offset.
+-- ===========================================================================
+-- Protocol version note
+-- ===========================================================================
+--
+-- This revision replaces the earlier UDP-only version of the protocol
+-- (Get / Response as a bare SEQUENCE OF Node) with a session-oriented
+-- protocol over QUIC, using QUIC's unreliable DATAGRAM extension
+-- (RFC 9221) as the substrate for an application-level reliable-but-
+-- UNORDERED delivery layer (see SummaryAck below). The earlier Python
+-- UDP client/server (client.py/server.py/common.py) implement the prior
+-- schema version and are NOT wire-compatible with this one; they are
+-- kept as-is rather than ported, since this revision is a distinct,
+-- QUIC-based implementation (see goimpl/).
+--
+-- Every message that carries application data (Get, Set, Create, Query,
+-- Response) carries its own `sequenceNumber`, monotonically increasing
+-- per sender per QUIC connection, independent per direction
+-- (client->server and server->client each have their own sequence
+-- space). This is the unit SummaryAck acknowledges and retransmission
+-- keys off of. SummaryAck itself is not sequence-numbered or itself
+-- acknowledged, the same way a bare ACK isn't ACKed in TCP/SCTP/QUIC's
+-- own loss recovery.
+
+-- ===========================================================================
+-- NodePointer / NodeValue / Node
+-- ===========================================================================
+
+-- The context tag is the pointer kind: 0 = absolute, 1 = offset, 2 = none.
 --
 -- An absolute pointer is a UTF8String holding a match expression:
 --
+--     request    = expression [ "@" resume-index ]
 --     expression = 1*( [ "/" ] key-regexp [ "=" value-regexp ] )
 --
 -- Each element matches a node by its key and, optionally, by its value.
--- The regexp dialect is left to the implementation; a literal "/" or "="
--- inside a regexp must be escaped with "\".
+-- The regexp dialect is left to the implementation; a literal "/", "=",
+-- or "@" inside a regexp must be escaped with "\". The optional
+-- "@<index>" suffix is a continuation cursor into `expression`'s own
+-- deterministic flattened result (see Response, below).
+--
+-- An offset pointer is a signed list-position delta, meaningful only
+-- inside a Response's own flattened `nodes` list (never sent by a
+-- client): the server's own encoding of "the next entry over there".
+--
+-- `none` is an explicit "no pointer", used when a client needs to SET
+-- firstChild/nextSibling to "nothing" (e.g. deleting a node by
+-- relinking around it, see Set, below). It is distinct from an offset
+-- of 0, which is a server-internal flattening sentinel, not something
+-- a client should ever need to construct itself.
 
 NodePointer ::= CHOICE {
     absolute  [0] UTF8String,
-    offset    [1] INTEGER
+    offset    [1] INTEGER,
+    none      [2] NULL
+}
+
+-- Typed leaf values, deliberately modeled on SNMP's SMIv2 ObjectSyntax
+-- (RFC 2578: INTEGER, OCTET STRING, Counter32, Unsigned32/Gauge32,
+-- TimeTicks, Counter64), since this protocol is SNMP-adjacent by
+-- design. `real` is NOT part of classic SNMP; it's added because
+-- aggregation results (mean, standard deviation, percentiles, see
+-- Query) are inherently fractional even when the source samples were
+-- integers, and the protocol needs somewhere to put that.
+--
+-- `real` is encoded as an OCTET STRING containing exactly 8 bytes: an
+-- IEEE 754 binary64 value, big-endian, NOT ASN.1's own REAL type.
+-- BER's REAL encoding is fully supported by this project's Python/BER
+-- tooling (verified), but Go's stdlib encoding/asn1 has no REAL support
+-- at all, and hand-rolling BER REAL parsing in Go was judged not worth
+-- the risk for what's ultimately just "one double." A fixed 8-byte
+-- OCTET STRING is trivial and robust in both languages.
+
+NodeValue ::= CHOICE {
+    integer32    [0] INTEGER (-2147483648..2147483647),
+    unsigned32   [1] INTEGER (0..4294967295),              -- Gauge32/Unsigned32
+    counter32    [2] INTEGER (0..4294967295),              -- wraps at 2^32
+    counter64    [3] INTEGER (0..18446744073709551615),    -- wraps at 2^64
+    timeTicks    [4] INTEGER (0..4294967295),               -- hundredths of a second
+    octetString  [5] OCTET STRING,                          -- opaque bytes / text; not aggregatable numerically
+    real         [6] OCTET STRING (SIZE(8)),                -- IEEE 754 binary64, big-endian; see note above
+    noValue      [7] NULL                                    -- explicit "no value" (e.g. a pure container node)
 }
 
 Node ::= SEQUENCE {
     key          UTF8String,
-    value        OCTET STRING,   -- opaque data
+    value        NodeValue,
     firstChild   NodePointer,
     nextSibling  NodePointer
 }
 
+-- ===========================================================================
+-- Requests
+-- ===========================================================================
+
 Get ::= SEQUENCE {
-    target  NodePointer
+    sequenceNumber  INTEGER,
+    target          NodePointer
 }
 
-Response ::= SEQUENCE OF Node
+-- Updates an existing node, identified by `target` (which must resolve
+-- to exactly one node; zero or multiple matches is an error). Each of
+-- newValue/newFirstChild/newNextSibling is independently optional:
+-- omitted means "leave this field unchanged". A field can be
+-- explicitly cleared by supplying a pointer whose value is `none`
+-- (NodePointer's none arm) for newFirstChild/newNextSibling.
+--
+-- Deletion is not a separate message: to delete a node, Set the
+-- pointer that reaches it, either the parent's firstChild (if it's the
+-- first child) or the preceding sibling's nextSibling (otherwise), to
+-- whatever the deleted node's OWN firstChild/nextSibling was pointing
+-- to (or `none`, if it had none), so the list closes back up around
+-- the gap.
+
+Set ::= SEQUENCE {
+    sequenceNumber  INTEGER,
+    target          NodePointer,
+    newValue        NodeValue OPTIONAL,
+    newFirstChild   NodePointer OPTIONAL,
+    newNextSibling  NodePointer OPTIONAL
+}
+
+-- Creates a new node under this session's own
+-- "/Sessions/Connection-ID=<session-id>/NewNodes" subtree (see
+-- SESSION PATHS, below), appended as that parent's last child. The
+-- server responds with a Response whose `nodes` contains exactly the
+-- one newly created node.
+
+Create ::= SEQUENCE {
+    sequenceNumber  INTEGER,
+    key             UTF8String,
+    value           NodeValue OPTIONAL   -- omitted = noValue container node
+}
+
+-- Aggregation, applicable only to numeric NodeValue kinds (everything
+-- except octetString/noValue); percentile's parameter is 0..100
+-- (e.g. 95 for P95).
+
+AggregationMethod ::= CHOICE {
+    min         [0] NULL,
+    max         [1] NULL,
+    mean        [2] NULL,
+    stdDev      [3] NULL,
+    percentile  [4] INTEGER (0..100)
+}
+
+-- A recurring (or one-shot) collection query against `nodeExpression`.
+--
+--   collectionInterval  how often (seconds) to internally re-evaluate
+--                        nodeExpression and sample matching nodes'
+--                        values. 0 means ONCE: perform exactly one
+--                        collection pass immediately (ignoring
+--                        aggregationInterval/transferInterval's
+--                        recurring cadence; a single sample is
+--                        aggregated, if requested, as one degenerate
+--                        window, and the result is transferred once).
+--   aggregationInterval  how often (seconds) to reduce the samples
+--                        collected so far via aggregationMethod.
+--                        Omitted: no aggregation, raw samples are what
+--                        gets transferred.
+--   aggregationMethod    required iff aggregationInterval is present.
+--   transferInterval     how often (seconds) accumulated results (raw
+--                        samples, or aggregation outputs) are
+--                        materialized as nodes under this session's own
+--                        "/Sessions/Connection-ID=<session-id>/QueryResults"
+--                        subtree and pushed to the client as a
+--                        Response (see SESSION PATHS, below).
+
+Query ::= SEQUENCE {
+    sequenceNumber       INTEGER,
+    nodeExpression       UTF8String,
+    collectionInterval   INTEGER,
+    aggregationInterval  INTEGER OPTIONAL,
+    aggregationMethod    AggregationMethod OPTIONAL,
+    transferInterval     INTEGER
+}
+
+-- ===========================================================================
+-- Responses
+-- ===========================================================================
+
+-- `inReplyTo` is the sequenceNumber of the request this Response is
+-- associated with: for Get/Set/Create, the request being answered; for
+-- a Query's periodic pushes, the originating Query's own
+-- sequenceNumber (the same value for every push that query produces,
+-- so the client can tell which active query a given push belongs to).
+--
+-- On error, `error` is TRUE, `errorNode` is an absolute NodePointer to
+-- the ErrorNode the server created under this session's own
+-- "/Sessions/Connection-ID=<session-id>/Errors" subtree (see SESSION
+-- PATHS, below) describing what went wrong, and `nodes` is empty.
+
+Response ::= SEQUENCE {
+    sequenceNumber  INTEGER,
+    inReplyTo       INTEGER,
+    error           BOOLEAN,
+    errorNode       NodePointer OPTIONAL,
+    nodes           SEQUENCE OF Node
+}
+
+-- ===========================================================================
+-- Reliability: SummaryAck
+-- ===========================================================================
+--
+-- QUIC DATAGRAM frames (RFC 9221) are unordered and NOT retransmitted
+-- by QUIC itself, though they remain congestion-controlled and are
+-- "ack-eliciting" at the QUIC layer. Node data tolerates arbitrary
+-- reordering (each Node is independently meaningful, and a Response's
+-- flattened `nodes` are reassembled by index via firstChild/
+-- nextSibling, not by arrival order), so this protocol deliberately
+-- does NOT use QUIC streams (reliable but strictly ordered) for
+-- application data. Instead, each datagram-carried message above is
+-- reliably delivered via this thin application-level layer: the
+-- receiver periodically reports which sequenceNumbers (per direction)
+-- it has received, as a compact list of inclusive ranges; the sender
+-- retransmits whatever hasn't been acknowledged after a timeout.
+
+SequenceRange ::= SEQUENCE {
+    first  INTEGER,
+    last   INTEGER   -- inclusive; first == last acknowledges one sequenceNumber
+}
+
+SummaryAck ::= SEQUENCE {
+    received  SEQUENCE OF SequenceRange
+}
+
+-- ===========================================================================
+-- The envelope actually carried in each QUIC DATAGRAM frame
+-- ===========================================================================
+
+NodeTreeMessage ::= CHOICE {
+    get         [0] Get,
+    set         [1] Set,
+    create      [2] Create,
+    query       [3] Query,
+    response    [4] Response,
+    summaryAck  [5] SummaryAck
+}
+
+-- ===========================================================================
+-- SESSION PATHS (convention, not a wire type)
+-- ===========================================================================
+--
+-- Every accepted QUIC connection gets a server-generated session id
+-- (NOT literally the QUIC-protocol-level Connection ID: quic-go's
+-- public API in the version used here doesn't cleanly expose that
+-- value outside its qlog Tracer hook, and the wire CID isn't even
+-- stable across a connection's lifetime, it rotates during path
+-- migration. A server-generated id is used instead, filling the same
+-- role.). That session's own three virtual subtrees, created lazily on
+-- first use, live at:
+--
+--     /Sessions/Connection-ID=<session-id>/NewNodes       (Create)
+--     /Sessions/Connection-ID=<session-id>/Errors         (errors)
+--     /Sessions/Connection-ID=<session-id>/QueryResults   (Query)
+--
+-- Note for anyone constructing an expression that reaches into one of
+-- these paths: the literal key "Connection-ID=<session-id>" contains
+-- an unescaped "=", which the expression grammar above treats as a
+-- key/value delimiter; write it as "Connection-ID\=<session-id>" in an
+-- expression.
 
 END
