@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 """Reference server for the NodeTree GET protocol (see node.asn).
 
-Listens on a TCP socket, decodes a length-prefixed BER-encoded `Get`
-message, evaluates its NodePointer match expression against an
-in-memory node tree, and replies with a length-prefixed BER-encoded
-`Response`.
+Listens on a UDP socket, decodes a BER-encoded `Get` datagram, evaluates
+its NodePointer match expression against an in-memory node tree, and
+replies with a BER-encoded `Response` datagram.
 """
 import argparse
 import socketserver
@@ -12,22 +11,25 @@ import socketserver
 from common import (
     DEFAULT_HOST,
     DEFAULT_PORT,
+    MAX_DATAGRAM_SIZE,
+    decode_message,
+    encode_message,
     evaluate_pointer,
     flatten_matches,
     parse_expression,
-    recv_message,
-    send_message,
 )
 from demo_data import DEMO_TREE
 
 
 class GetHandler(socketserver.BaseRequestHandler):
     def handle(self):
+        data, sock = self.request
         peer = self.client_address
+
         try:
-            get = recv_message(self.request, "Get")
-        except EOFError as exc:
-            print(f"[server] {peer}: {exc}")
+            get = decode_message("Get", data)
+        except Exception as exc:  # malformed datagram
+            print(f"[server] {peer}: bad Get message: {exc}")
             return
 
         pointer_type, pointer_value = get["target"]
@@ -36,7 +38,7 @@ class GetHandler(socketserver.BaseRequestHandler):
         if pointer_type != "absolute":
             print(f"[server] {peer}: offset pointers aren't resolvable "
                   f"from a client request; returning empty response")
-            send_message(self.request, "Response", [])
+            sock.sendto(encode_message("Response", []), peer)
             return
 
         try:
@@ -44,13 +46,20 @@ class GetHandler(socketserver.BaseRequestHandler):
             matches = evaluate_pointer(DEMO_TREE, segments)
         except ValueError as exc:
             print(f"[server] {peer}: bad expression: {exc}")
-            send_message(self.request, "Response", [])
+            sock.sendto(encode_message("Response", []), peer)
             return
 
         response = flatten_matches(matches)
+        encoded = encode_message("Response", response)
+        if len(encoded) > MAX_DATAGRAM_SIZE:
+            print(f"[server] {peer}: response too large for one datagram "
+                  f"({len(encoded)} bytes); returning empty response")
+            sock.sendto(encode_message("Response", []), peer)
+            return
+
         print(f"[server] {peer}: {len(matches)} match(es), "
               f"{len(response)} node(s) in response")
-        send_message(self.request, "Response", response)
+        sock.sendto(encoded, peer)
 
 
 def main():
@@ -59,9 +68,8 @@ def main():
     parser.add_argument("--port", type=int, default=DEFAULT_PORT)
     args = parser.parse_args()
 
-    socketserver.ThreadingTCPServer.allow_reuse_address = True
-    with socketserver.ThreadingTCPServer((args.host, args.port), GetHandler) as server:
-        print(f"[server] listening on {args.host}:{args.port}")
+    with socketserver.ThreadingUDPServer((args.host, args.port), GetHandler) as server:
+        print(f"[server] listening on {args.host}:{args.port} (UDP)")
         server.serve_forever()
 
 

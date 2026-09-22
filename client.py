@@ -1,13 +1,21 @@
 #!/usr/bin/env python3
 """Reference client for the NodeTree GET protocol (see node.asn).
 
-Sends a `Get` message for the given NodePointer match expression and
-prints the resulting `Response`.
+Sends a `Get` datagram for the given NodePointer match expression over
+UDP and prints the resulting `Response`.
 """
 import argparse
 import socket
 
-from common import DEFAULT_HOST, DEFAULT_PORT, recv_message, send_message
+from common import (
+    DEFAULT_HOST,
+    DEFAULT_PORT,
+    MAX_DATAGRAM_SIZE,
+    decode_message,
+    encode_message,
+)
+
+TIMEOUT_SECONDS = 5.0
 
 
 def main():
@@ -15,11 +23,24 @@ def main():
     parser.add_argument("expression", help='NodePointer match expression, e.g. "/users/alice"')
     parser.add_argument("--host", default=DEFAULT_HOST)
     parser.add_argument("--port", type=int, default=DEFAULT_PORT)
+    parser.add_argument("--timeout", type=float, default=TIMEOUT_SECONDS)
     args = parser.parse_args()
 
-    with socket.create_connection((args.host, args.port)) as sock:
-        send_message(sock, "Get", {"target": ("absolute", args.expression)})
-        response = recv_message(sock, "Response")
+    request = encode_message("Get", {"target": ("absolute", args.expression)})
+
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.settimeout(args.timeout)
+    try:
+        sock.sendto(request, (args.host, args.port))
+        try:
+            data, _ = sock.recvfrom(MAX_DATAGRAM_SIZE)
+        except socket.timeout:
+            print(f"(no reply from {args.host}:{args.port} within {args.timeout}s)")
+            return
+    finally:
+        sock.close()
+
+    response = decode_message("Response", data)
 
     if not response:
         print("(no matches)")

@@ -1,12 +1,12 @@
 """Shared plumbing for the NodeTree GET protocol client and server.
 
-Wire format: each message is a 4-byte big-endian length prefix followed
-by that many bytes of BER encoding of a `Get` or `Response` value from
-node.asn.
+Wire format: each message is a single UDP datagram containing the BER
+encoding of a `Get` or `Response` value from node.asn. UDP preserves
+datagram boundaries, so no length prefix is needed -- but a `Response`
+that would exceed MAX_DATAGRAM_SIZE cannot be sent (see server.py).
 """
-import re
-import struct
 from pathlib import Path
+import re
 
 import asn1tools
 
@@ -16,28 +16,19 @@ SPEC = asn1tools.compile_files(str(SPEC_PATH), "ber")
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8514
 
+# Practical upper bound for a UDP payload that won't be fragmented (and
+# safely under the 65507-byte theoretical max for IPv4).
+MAX_DATAGRAM_SIZE = 65507
+
 
 # --- framing -----------------------------------------------------------
 
-def send_message(sock, type_name, value):
-    encoded = SPEC.encode(type_name, value)
-    sock.sendall(struct.pack(">I", len(encoded)) + encoded)
+def encode_message(type_name, value):
+    return SPEC.encode(type_name, value)
 
 
-def recv_exact(sock, n):
-    buf = bytearray()
-    while len(buf) < n:
-        chunk = sock.recv(n - len(buf))
-        if not chunk:
-            raise EOFError("connection closed while reading")
-        buf.extend(chunk)
-    return bytes(buf)
-
-
-def recv_message(sock, type_name):
-    (length,) = struct.unpack(">I", recv_exact(sock, 4))
-    encoded = recv_exact(sock, length)
-    return SPEC.decode(type_name, encoded)
+def decode_message(type_name, data):
+    return SPEC.decode(type_name, data)
 
 
 # --- NodePointer match-expression parsing -------------------------------
