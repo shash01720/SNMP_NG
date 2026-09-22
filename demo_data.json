@@ -1,0 +1,23 @@
+{
+  "key": "root",
+  "value": "",
+  "children": [
+    {
+      "key": "users",
+      "value": "",
+      "children": [
+        {"key": "alice", "value": "admin", "children": []},
+        {"key": "bob", "value": "user", "children": []},
+        {"key": "carol", "value": "user", "children": []}
+      ]
+    },
+    {
+      "key": "config",
+      "value": "",
+      "children": [
+        {"key": "timeout", "value": "30", "children": []},
+        {"key": "retries", "value": "3", "children": []}
+      ]
+    }
+  ]
+}
