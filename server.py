@@ -20,6 +20,7 @@ from common import (
     decode_message,
     evaluate_pointer,
     flatten_matches,
+    format_packet_dump,
     get_udp_mss,
     parse_expression,
     split_resume_suffix,
@@ -30,21 +31,25 @@ from demo_data import DEMO_TREE
 class GetHandler(socketserver.BaseRequestHandler):
     def handle(self):
         data, sock = self.request
-        peer = self.client_address
+        self.peer = self.client_address
+        self.local = self.server.server_address
+
+        if self.server.pcap:
+            print(format_packet_dump("recv", self.local, self.peer, data))
 
         try:
             get = decode_message("Get", data)
         except Exception as exc:  # malformed datagram
-            print(f"[server] {peer}: bad Get message: {exc}")
+            print(f"[server] {self.peer}: bad Get message: {exc}")
             return
 
         pointer_type, pointer_value = get["target"]
-        print(f"[server] {peer}: Get target={pointer_type}:{pointer_value!r}")
+        print(f"[server] {self.peer}: Get target={pointer_type}:{pointer_value!r}")
 
         if pointer_type != "absolute":
-            print(f"[server] {peer}: offset pointers aren't resolvable "
+            print(f"[server] {self.peer}: offset pointers aren't resolvable "
                   f"from a client request; returning empty response")
-            sock.sendto(encode_message("Response", []), peer)
+            self._reply(sock, [])
             return
 
         base_expression, resume_index = split_resume_suffix(pointer_value)
@@ -53,8 +58,8 @@ class GetHandler(socketserver.BaseRequestHandler):
             segments = parse_expression(base_expression)
             matches = evaluate_pointer(DEMO_TREE, segments)
         except ValueError as exc:
-            print(f"[server] {peer}: bad expression: {exc}")
-            sock.sendto(encode_message("Response", []), peer)
+            print(f"[server] {self.peer}: bad expression: {exc}")
+            self._reply(sock, [])
             return
 
         # Recomputed fresh (and deterministically) on every request, so
@@ -62,22 +67,26 @@ class GetHandler(socketserver.BaseRequestHandler):
         wire_nodes = flatten_matches(matches)
 
         if resume_index < 0 or resume_index > len(wire_nodes):
-            print(f"[server] {peer}: resume index {resume_index} out of "
+            print(f"[server] {self.peer}: resume index {resume_index} out of "
                   f"range for {len(wire_nodes)} node(s); returning empty response")
-            sock.sendto(encode_message("Response", []), peer)
+            self._reply(sock, [])
             return
 
-        mss = self.server.mss_override or get_udp_mss(peer)
+        mss = self.server.mss_override or get_udp_mss(self.peer)
         response, truncated = build_response_for_mss(
             wire_nodes, resume_index, mss, base_expression)
-        encoded = encode_message("Response", response)
 
         status = "truncated" if truncated else "complete"
-        print(f"[server] {peer}: {len(matches)} match(es), sending "
+        print(f"[server] {self.peer}: {len(matches)} match(es), sending "
               f"{len(response)}/{len(wire_nodes) - resume_index} remaining "
-              f"node(s) from index {resume_index} "
-              f"({status}, mss={mss}, {len(encoded)} bytes)")
-        sock.sendto(encoded, peer)
+              f"node(s) from index {resume_index} ({status}, mss={mss})")
+        self._reply(sock, response)
+
+    def _reply(self, sock, response):
+        encoded = encode_message("Response", response)
+        if self.server.pcap:
+            print(format_packet_dump("send", self.local, self.peer, encoded))
+        sock.sendto(encoded, self.peer)
 
 
 def main():
@@ -87,10 +96,14 @@ def main():
     parser.add_argument("--mss", type=int, default=None,
                          help="Override the auto-detected MSS (bytes); "
                               "mainly for testing/demoing truncation.")
+    parser.add_argument("--pcap", action="store_true",
+                         help="Print a tcpdump -X-style hex dump of each "
+                              "datagram's UDP payload as it's sent/received.")
     args = parser.parse_args()
 
     with socketserver.ThreadingUDPServer((args.host, args.port), GetHandler) as server:
         server.mss_override = args.mss
+        server.pcap = args.pcap
         print(f"[server] listening on {args.host}:{args.port} (UDP)"
               + (f", mss override={args.mss}" if args.mss else ""))
         server.serve_forever()

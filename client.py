@@ -17,30 +17,36 @@ from common import (
     MAX_DATAGRAM_SIZE,
     decode_message,
     encode_message,
+    format_packet_dump,
 )
 
 TIMEOUT_SECONDS = 5.0
 MAX_FOLLOWUPS = 50  # loop guard against a cyclic/misbehaving server
 
 
-def send_get(sock, addr, expression, timeout):
+def send_get(sock, addr, expression, timeout, pcap=False):
     request = encode_message("Get", {"target": ("absolute", expression)})
+    local = sock.getsockname()
+    if pcap:
+        print(format_packet_dump("send", local, addr, request))
+
     sock.settimeout(timeout)
     sock.sendto(request, addr)
     try:
         data, _ = sock.recvfrom(MAX_DATAGRAM_SIZE)
     except socket.timeout:
         return None
+
+    if pcap:
+        print(format_packet_dump("recv", local, addr, data))
     return decode_message("Response", data)
 
 
 def print_batch(label, response):
     print(f"-- {label} ({len(response)} node(s)) --")
     for node in response:
-        _, fc = node["firstChild"]
-        _, ns = node["nextSibling"]
-        fc_type, _ = node["firstChild"]
-        ns_type, _ = node["nextSibling"]
+        fc_type, fc = node["firstChild"]
+        ns_type, ns = node["nextSibling"]
         fc_str = "none" if (fc_type == "offset" and fc == 0) else (
             f"+{fc}" if fc_type == "offset" else f"-> {fc!r}")
         ns_str = "none" if (ns_type == "offset" and ns == 0) else (
@@ -55,10 +61,14 @@ def main():
     parser.add_argument("--host", default=DEFAULT_HOST)
     parser.add_argument("--port", type=int, default=DEFAULT_PORT)
     parser.add_argument("--timeout", type=float, default=TIMEOUT_SECONDS)
+    parser.add_argument("--pcap", action="store_true",
+                         help="Print a tcpdump -X-style hex dump of each "
+                              "datagram's UDP payload as it's sent/received.")
     args = parser.parse_args()
     addr = (args.host, args.port)
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.bind((args.host, 0))  # pin a concrete local port for --pcap output
     try:
         seen = {args.expression}
         queue = [args.expression]
@@ -67,7 +77,7 @@ def main():
 
         while queue:
             expression = queue.pop(0)
-            response = send_get(sock, addr, expression, args.timeout)
+            response = send_get(sock, addr, expression, args.timeout, args.pcap)
             if response is None:
                 print(f"(no reply for {expression!r} from "
                       f"{args.host}:{args.port} within {args.timeout}s)")

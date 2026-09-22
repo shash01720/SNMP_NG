@@ -9,6 +9,7 @@ continuation NodePointers, rather than sent as one oversized packet.
 from pathlib import Path
 import re
 import socket
+import time
 
 import asn1tools
 
@@ -38,6 +39,28 @@ def encode_message(type_name, value):
 
 def decode_message(type_name, data):
     return SPEC.decode(type_name, data)
+
+
+# --- packet-capture-style dumps (--pcap) ----------------------------------
+#
+# A tcpdump -X-style dump of one real UDP datagram, for eyeballing what's
+# actually on the wire. This can only show the UDP *payload* (the BER
+# bytes this process itself sent or received) -- it doesn't synthesize
+# Ethernet/IP/UDP headers, since those would have to be fabricated
+# without an OS-level capture (see README.md for a real tcpdump command).
+
+def format_packet_dump(direction, local_addr, remote_addr, payload):
+    src, dst = (local_addr, remote_addr) if direction == "send" else (remote_addr, local_addr)
+    now = time.time()
+    ts = time.strftime("%H:%M:%S", time.localtime(now)) + f".{int(now * 1e6) % 1000000:06d}"
+    lines = [f"{ts} IP {src[0]}.{src[1]} > {dst[0]}.{dst[1]}: UDP, length {len(payload)}"]
+    for offset in range(0, len(payload), 16):
+        chunk = payload[offset:offset + 16]
+        pairs = [chunk[i:i + 2].hex() for i in range(0, len(chunk), 2)]
+        hex_str = " ".join(pairs).ljust(39)
+        ascii_str = "".join(chr(b) if 32 <= b < 127 else "." for b in chunk)
+        lines.append(f"\t0x{offset:04x}:  {hex_str}  {ascii_str}")
+    return "\n".join(lines)
 
 
 # --- MSS discovery ---------------------------------------------------------
