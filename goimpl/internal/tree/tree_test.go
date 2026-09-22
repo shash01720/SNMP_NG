@@ -158,3 +158,98 @@ func TestSetDeleteViaNextSibling(t *testing.T) {
 }
 
 func ptrNodePointer(p wire.NodePointer) *wire.NodePointer { return &p }
+
+// --- FitToSize / continuation ---------------------------------------------
+
+// byteMeasure is a stand-in "how big would this be on the wire" function
+// for tests: each node costs a fixed number of "bytes" plus 1 per byte of
+// key length, so results are easy to reason about without pulling in the
+// wire package's real BER codec here.
+func byteMeasure(nodes []wire.Node) int {
+	total := 0
+	for _, n := range nodes {
+		total += 10 + len(n.Key)
+	}
+	return total
+}
+
+func TestFitToSizeNoTruncationNeeded(t *testing.T) {
+	tr := demoTree()
+	flat, resume, base, err := tr.GetFull("/config")
+	if err != nil {
+		t.Fatal(err)
+	}
+	window, truncated := FitToSize(flat, resume, base, 10000, byteMeasure)
+	if truncated {
+		t.Fatal("should not need truncation with a huge size budget")
+	}
+	if len(window) != len(flat)-resume {
+		t.Fatalf("got %d nodes, want %d", len(window), len(flat)-resume)
+	}
+}
+
+func TestFitToSizeTruncatesAndChains(t *testing.T) {
+	tr := demoTree()
+	flat, resume, base, err := tr.GetFull("/users")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(flat) != 9 {
+		t.Fatalf("expected 9 flattened nodes, got %d", len(flat))
+	}
+
+	// Budget for exactly one node (10 + len("users") = 15) plus a little
+	// slack, but not enough for two.
+	budget := byteMeasure(flat[0:1]) + 2
+	window, truncated := FitToSize(flat, resume, base, budget, byteMeasure)
+	if !truncated {
+		t.Fatal("expected truncation")
+	}
+	if len(window) != 1 {
+		t.Fatalf("got %d node(s), want 1", len(window))
+	}
+	if window[0].Key != "users" {
+		t.Fatalf("got key %q, want users", window[0].Key)
+	}
+	if window[0].FirstChild.Kind != wire.PointerAbsolute {
+		t.Fatalf("firstChild = %+v, want an absolute continuation pointer", window[0].FirstChild)
+	}
+	wantContinuation := base + "@1"
+	if window[0].FirstChild.Absolute != wantContinuation {
+		t.Fatalf("firstChild = %q, want %q", window[0].FirstChild.Absolute, wantContinuation)
+	}
+
+	// Follow the continuation: resuming at index 1 should reach "user"
+	// (alice), whose own nextSibling (offset +1, to "group") is within
+	// bounds this time and should NOT be rewritten.
+	nextBase, nextResume := SplitResumeSuffix(wantContinuation)
+	if nextBase != base || nextResume != 1 {
+		t.Fatalf("SplitResumeSuffix(%q) = (%q, %d), want (%q, 1)", wantContinuation, nextBase, nextResume, base)
+	}
+	flat2, resume2, base2, err := tr.GetFull(wantContinuation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	window2, truncated2 := FitToSize(flat2, resume2, base2, 10000, byteMeasure)
+	if truncated2 {
+		t.Fatal("should not need truncation with a huge size budget on the continuation")
+	}
+	if len(window2) != 8 || window2[0].Key != "user" {
+		t.Fatalf("continuation window = %+v", window2)
+	}
+}
+
+func TestFitToSizeCannotFitEvenOneNode(t *testing.T) {
+	tr := demoTree()
+	flat, resume, base, err := tr.GetFull("/config")
+	if err != nil {
+		t.Fatal(err)
+	}
+	window, truncated := FitToSize(flat, resume, base, 1, byteMeasure) // budget too small for anything
+	if window != nil {
+		t.Fatalf("expected no nodes to fit, got %+v", window)
+	}
+	if !truncated {
+		t.Fatal("expected truncated=true when there was data but none of it fit")
+	}
+}

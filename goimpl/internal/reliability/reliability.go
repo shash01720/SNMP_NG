@@ -112,6 +112,18 @@ func (s *Sender) Send(seq int64, payload []byte) error {
 	return s.sendFunc(payload)
 }
 
+// Cancel removes seq from the pending (retransmit) set without it ever
+// having been acknowledged. Used when a send is known to be permanently
+// undeliverable as sent (e.g. QUIC's DatagramTooLargeError) so it isn't
+// blindly retransmitted forever with the same oversized payload; the
+// caller is expected to build a corrected payload and Send it (optionally
+// reusing the same seq).
+func (s *Sender) Cancel(seq int64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.pending, seq)
+}
+
 // HandleAck removes every sequence number ack.Received covers from the
 // pending (retransmit) set.
 func (s *Sender) HandleAck(ack *wire.SummaryAck) {

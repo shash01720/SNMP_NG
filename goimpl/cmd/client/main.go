@@ -206,7 +206,22 @@ func printResponse(label string, r *wire.Response) {
 	}
 	fmt.Printf("%s: %d node(s)\n", label, len(r.Nodes))
 	for _, n := range r.Nodes {
-		fmt.Printf("    key=%q value=%s\n", n.Key, formatValue(n.Value))
+		fmt.Printf("    key=%q value=%s firstChild=%s nextSibling=%s\n",
+			n.Key, formatValue(n.Value), formatPointer(n.FirstChild), formatPointer(n.NextSibling))
+	}
+}
+
+func formatPointer(p wire.NodePointer) string {
+	switch p.Kind {
+	case wire.PointerOffset:
+		if p.Offset == 0 {
+			return "none"
+		}
+		return fmt.Sprintf("+%d", p.Offset)
+	case wire.PointerAbsolute:
+		return fmt.Sprintf("-> %q", p.Absolute) // a continuation pointer, if the result was truncated
+	default:
+		return "none"
 	}
 }
 
@@ -235,18 +250,62 @@ func formatValue(v wire.NodeValue) string {
 
 // --- commands --------------------------------------------------------------
 
+// maxFollowups guards against a cyclic or misbehaving server sending
+// continuation pointers forever.
+const maxFollowups = 50
+
 func runGet(ctx context.Context, c *client, args []string) {
 	if len(args) != 1 {
 		fmt.Fprintln(os.Stderr, "usage: get <expression>")
 		os.Exit(2)
 	}
-	seq := c.allocSeq()
-	msg := wire.Message{Kind: wire.MsgGet, Get: &wire.Get{SequenceNumber: seq, Target: wire.AbsolutePointer(args[0])}}
-	resp, err := c.sendAndWait(ctx, seq, msg)
-	if err != nil {
-		log.Fatalf("get: %v", err)
+	followGet(ctx, c, "get", args[0])
+}
+
+// followGet sends expression as a Get, prints the Response, and then
+// automatically issues a fresh Get for every absolute NodePointer found in
+// a returned node's firstChild/nextSibling: a continuation the server
+// generated because the full result didn't fit in one QUIC datagram (see
+// node.asn's NodePointer docs and internal/tree.FitToSize) -- repeating
+// until no continuations remain, so the caller always sees the complete,
+// correctly-linked result regardless of how many datagrams it took.
+func followGet(ctx context.Context, c *client, label, expression string) {
+	seen := map[string]bool{expression: true}
+	queue := []string{expression}
+	followups := 0
+
+	for len(queue) > 0 {
+		expr := queue[0]
+		queue = queue[1:]
+
+		seq := c.allocSeq()
+		msg := wire.Message{Kind: wire.MsgGet, Get: &wire.Get{SequenceNumber: seq, Target: wire.AbsolutePointer(expr)}}
+		resp, err := c.sendAndWait(ctx, seq, msg)
+		if err != nil {
+			log.Fatalf("get: %v", err)
+		}
+
+		batchLabel := label
+		if expr != expression {
+			batchLabel = fmt.Sprintf("%s (continuation of %q)", label, expr)
+		}
+		printResponse(batchLabel, resp)
+
+		for _, n := range resp.Nodes {
+			for _, p := range []wire.NodePointer{n.FirstChild, n.NextSibling} {
+				if p.Kind != wire.PointerAbsolute || seen[p.Absolute] {
+					continue
+				}
+				if followups >= maxFollowups {
+					log.Printf("get: hit max-followups=%d, not following %q", maxFollowups, p.Absolute)
+					continue
+				}
+				seen[p.Absolute] = true
+				queue = append(queue, p.Absolute)
+				followups++
+			}
+		}
 	}
-	printResponse("get", resp)
 }
 
 func runSet(ctx context.Context, c *client, args []string) {

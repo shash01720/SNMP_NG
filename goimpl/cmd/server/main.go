@@ -4,6 +4,7 @@ package main
 import (
 	"context"
 	"flag"
+	"fmt"
 	"log"
 	"os/signal"
 	"syscall"
@@ -15,8 +16,19 @@ import (
 	"github.com/shashi/snmp-ng/goimpl/internal/wire"
 )
 
+func overrideSuffix(n int) string {
+	if n <= 0 {
+		return ""
+	}
+	return fmt.Sprintf(", max-datagram-size override=%d", n)
+}
+
 func main() {
 	addr := flag.String("addr", "127.0.0.1:8515", "UDP address to listen on")
+	maxDatagramSize := flag.Int("max-datagram-size", 0,
+		"override the auto-discovered per-datagram payload budget (bytes); "+
+			"mainly for testing/demoing truncation, since a real path's limit "+
+			"is far larger than this demo's small tree would ever exceed")
 	flag.Parse()
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
@@ -36,9 +48,10 @@ func main() {
 	defer ln.Close()
 
 	srv := server.New()
+	srv.MaxDatagramSizeOverride = *maxDatagramSize
 	seedDemoData(srv)
 
-	log.Printf("[server] listening on %s (QUIC)", *addr)
+	log.Printf("[server] listening on %s (QUIC)%s", *addr, overrideSuffix(*maxDatagramSize))
 	if err := srv.Run(ctx, ln); err != nil {
 		log.Fatalf("serve: %v", err)
 	}

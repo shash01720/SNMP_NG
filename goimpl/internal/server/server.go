@@ -7,6 +7,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"log"
 	"sync"
@@ -28,6 +29,13 @@ const (
 
 type Server struct {
 	Tree *tree.Tree
+
+	// MaxDatagramSizeOverride, if set (>0), is used as every session's
+	// datagram size budget instead of discovering it from a real
+	// quic.DatagramTooLargeError. Mainly for testing/demoing truncation:
+	// on a real network path the discovered limit is far larger than this
+	// repo's small demo tree would ever exceed.
+	MaxDatagramSizeOverride int
 }
 
 func New() *Server {
@@ -72,6 +80,26 @@ type Session struct {
 
 	queriesMu     sync.Mutex
 	activeQueries map[int64]*query.Runner
+
+	// maxDatagramMu/maxDatagramSize: this connection's discovered (or
+	// overridden) per-datagram payload budget. 0 means "not yet learned";
+	// sendFittedNodes/sendBatched discover it lazily from the first
+	// quic.DatagramTooLargeError, and cache it here so later sends in the
+	// same session don't have to rediscover it.
+	maxDatagramMu   sync.Mutex
+	maxDatagramSize int
+}
+
+func (sess *Session) getMaxDatagramSize() int {
+	sess.maxDatagramMu.Lock()
+	defer sess.maxDatagramMu.Unlock()
+	return sess.maxDatagramSize
+}
+
+func (sess *Session) setMaxDatagramSize(n int) {
+	sess.maxDatagramMu.Lock()
+	defer sess.maxDatagramMu.Unlock()
+	sess.maxDatagramSize = n
 }
 
 func (s *Server) newSession(conn *quic.Conn) *Session {
@@ -94,6 +122,9 @@ func (s *Server) newSession(conn *quic.Conn) *Session {
 		log.Printf("[server] session %s: giving up on unacked datagram (seq %d) after %d attempts", id, seq, maxRetransmits)
 	})
 	sess.receiver = reliability.NewReceiver()
+	if s.MaxDatagramSizeOverride > 0 {
+		sess.maxDatagramSize = s.MaxDatagramSizeOverride
+	}
 	return sess
 }
 
@@ -234,6 +265,69 @@ func (sess *Session) respondAndCache(requestSeq int64, resp *wire.Response) {
 	sess.respCacheMu.Unlock()
 }
 
+// sendFittedNodes sends flat[resumeIndex:] as a Response to requestSeq,
+// fitting it into one QUIC datagram. If the full remainder doesn't fit, it
+// is truncated via tree.FitToSize (rewriting the offset pointer(s) that
+// would have reached past the cut into an absolute
+// "<baseExpression>@<index>" continuation pointer the client can Get to
+// resume) -- see node.asn's NodePointer docs and the repo's Python/UDP
+// reference implementation, which this mirrors.
+//
+// The datagram size budget is learned reactively: quic-go has no proactive
+// "max datagram size" query, only a quic.DatagramTooLargeError returned
+// from a failed send naming the actual limit (Conn.SendDatagram's doc
+// comment). The optimistic first attempt sends the untruncated remainder
+// directly; on DatagramTooLargeError, the discovered limit is cached on
+// the session (so later sends in the same session skip straight to
+// fitting) and a corrected, fitted payload is sent instead.
+func (sess *Session) sendFittedNodes(requestSeq int64, flat []wire.Node, resumeIndex int, baseExpression string) {
+	txSeq := sess.allocSeq()
+	build := func(nodes []wire.Node) *wire.Response {
+		return &wire.Response{SequenceNumber: txSeq, InReplyTo: requestSeq, Nodes: nodes}
+	}
+	measure := func(nodes []wire.Node) int {
+		return len(wire.MarshalMessage(wire.Message{Kind: wire.MsgResponse, Response: build(nodes)}))
+	}
+
+	nodes := flat[resumeIndex:]
+	if cached := sess.getMaxDatagramSize(); cached > 0 && measure(nodes) > cached {
+		fitted, _ := tree.FitToSize(flat, resumeIndex, baseExpression, cached, measure)
+		nodes = fitted
+	}
+
+	for attempt := 0; attempt < 2; attempt++ {
+		resp := build(nodes)
+		payload := wire.MarshalMessage(wire.Message{Kind: wire.MsgResponse, Response: resp})
+
+		err := sess.sender.Send(txSeq, payload)
+		if err == nil {
+			sess.respCacheMu.Lock()
+			sess.respCache[requestSeq] = resp
+			sess.respCacheMu.Unlock()
+			return
+		}
+
+		var tooLarge *quic.DatagramTooLargeError
+		if !errors.As(err, &tooLarge) {
+			log.Printf("[server] session %s: send error: %v", sess.ID, err)
+			return
+		}
+		sess.sender.Cancel(txSeq) // don't blindly retransmit the oversized payload
+		sess.setMaxDatagramSize(int(tooLarge.MaxDatagramPayloadSize))
+
+		fitted, _ := tree.FitToSize(flat, resumeIndex, baseExpression, int(tooLarge.MaxDatagramPayloadSize), measure)
+		if len(fitted) == 0 && len(nodes) > 0 {
+			log.Printf("[server] session %s: cannot fit even one node within max datagram size %d for request seq %d",
+				sess.ID, tooLarge.MaxDatagramPayloadSize, requestSeq)
+			return
+		}
+		nodes = fitted
+		// loop once more to send the now-fitted payload
+	}
+	log.Printf("[server] session %s: gave up fitting a response for request seq %d after repeated DatagramTooLargeError",
+		sess.ID, requestSeq)
+}
+
 // --- error nodes --------------------------------------------------------
 
 // errorCodes used by this server; kept simple (no "/", "=", regex
@@ -279,12 +373,12 @@ func (sess *Session) handleGet(g *wire.Get) {
 		sess.respondError(g.SequenceNumber, errInvalidExpression, "Get.target must be an absolute expression")
 		return
 	}
-	nodes, err := sess.server.Tree.Get(g.Target.Absolute)
+	flat, resumeIndex, base, err := sess.server.Tree.GetFull(g.Target.Absolute)
 	if err != nil {
 		sess.respondError(g.SequenceNumber, errInvalidExpression, err.Error())
 		return
 	}
-	sess.respondAndCache(g.SequenceNumber, &wire.Response{InReplyTo: g.SequenceNumber, Nodes: nodes})
+	sess.sendFittedNodes(g.SequenceNumber, flat, resumeIndex, base)
 }
 
 // --- Set -------------------------------------------------------------------
@@ -371,8 +465,71 @@ func (s sessionResultSink) DeliverResults(querySeq int64, results map[string][]w
 			})
 		}
 	}
-	txSeq := s.sess.allocSeq()
-	resp := &wire.Response{SequenceNumber: txSeq, InReplyTo: querySeq, Nodes: nodes}
-	payload := wire.MarshalMessage(wire.Message{Kind: wire.MsgResponse, Response: resp})
-	return s.sess.sender.Send(txSeq, payload)
+	return s.sess.sendBatched(querySeq, nodes)
+}
+
+// sendBatched sends `nodes` as one or more Response messages (each with
+// its own fresh sequenceNumber, all sharing inReplyTo), splitting across
+// multiple datagrams if they don't all fit in one. Unlike sendFittedNodes
+// (used for Get, where a node's offset pointers encode real relationships
+// to other nodes that must be preserved via a continuation pointer),
+// Query's pushed nodes are independent results with no internal pointer
+// relationships to preserve (see DeliverResults, above, which always
+// gives each one a trivial "none" firstChild/nextSibling), so this only
+// needs to split the list into datagram-sized batches -- no offset
+// rewriting.
+func (sess *Session) sendBatched(inReplyTo int64, nodes []wire.Node) error {
+	if len(nodes) == 0 {
+		return nil // nothing to push this transfer
+	}
+	for len(nodes) > 0 {
+		txSeq := sess.allocSeq()
+		build := func(n []wire.Node) *wire.Response {
+			return &wire.Response{SequenceNumber: txSeq, InReplyTo: inReplyTo, Nodes: n}
+		}
+		measure := func(n []wire.Node) int {
+			return len(wire.MarshalMessage(wire.Message{Kind: wire.MsgResponse, Response: build(n)}))
+		}
+
+		batch := nodes
+		if cached := sess.getMaxDatagramSize(); cached > 0 && measure(batch) > cached {
+			batch = fitBatch(nodes, cached, measure)
+		}
+
+		sent := false
+		for attempt := 0; attempt < 2; attempt++ {
+			payload := wire.MarshalMessage(wire.Message{Kind: wire.MsgResponse, Response: build(batch)})
+			err := sess.sender.Send(txSeq, payload)
+			if err == nil {
+				sent = true
+				break
+			}
+			var tooLarge *quic.DatagramTooLargeError
+			if !errors.As(err, &tooLarge) {
+				return err
+			}
+			sess.sender.Cancel(txSeq)
+			sess.setMaxDatagramSize(int(tooLarge.MaxDatagramPayloadSize))
+			batch = fitBatch(nodes, int(tooLarge.MaxDatagramPayloadSize), measure)
+			if len(batch) == 0 {
+				return fmt.Errorf("cannot fit even one node within max datagram size %d", tooLarge.MaxDatagramPayloadSize)
+			}
+		}
+		if !sent {
+			return fmt.Errorf("gave up fitting a batch after repeated DatagramTooLargeError")
+		}
+		nodes = nodes[len(batch):]
+	}
+	return nil
+}
+
+// fitBatch returns the largest prefix of nodes whose batch fits within
+// maxSize, per measure.
+func fitBatch(nodes []wire.Node, maxSize int, measure func([]wire.Node) int) []wire.Node {
+	for n := len(nodes); n > 0; n-- {
+		if measure(nodes[:n]) <= maxSize {
+			return nodes[:n]
+		}
+	}
+	return nil
 }

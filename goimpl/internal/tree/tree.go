@@ -271,19 +271,84 @@ func flattenSubtree(root *Node) []wire.Node {
 // --- Tree-level convenience wrappers (locking) ----------------------------
 
 func (t *Tree) Get(expression string) ([]wire.Node, error) {
-	t.mu.RLock()
-	defer t.mu.RUnlock()
-	base, resume := SplitResumeSuffix(expression)
-	segments, err := ParseExpression(base)
+	flat, resume, _, err := t.GetFull(expression)
 	if err != nil {
 		return nil, err
 	}
-	matches := Evaluate(t.Root, segments)
-	flat := FlattenMatches(matches)
-	if resume < 0 || resume > len(flat) {
-		return nil, fmt.Errorf("resume index %d out of range for %d node(s)", resume, len(flat))
-	}
 	return flat[resume:], nil
+}
+
+// GetFull evaluates `expression` and returns its FULL deterministic
+// flattened result (from index 0 -- the same array regardless of any
+// "@resume" suffix on expression), the resume index to start delivering
+// from, and the base expression (with any "@resume" suffix stripped) to
+// use when generating "<base>@<index>" continuation pointers.
+//
+// Callers that need to fit a limited number of nodes into one message
+// (e.g. one QUIC datagram) use this plus FitToSize instead of Get, which
+// always returns the complete remainder.
+func (t *Tree) GetFull(expression string) (flat []wire.Node, resumeIndex int, base string, err error) {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	base, resumeIndex = SplitResumeSuffix(expression)
+	segments, err := ParseExpression(base)
+	if err != nil {
+		return nil, 0, "", err
+	}
+	matches := Evaluate(t.Root, segments)
+	flat = FlattenMatches(matches)
+	if resumeIndex < 0 || resumeIndex > len(flat) {
+		return nil, 0, "", fmt.Errorf("resume index %d out of range for %d node(s)", resumeIndex, len(flat))
+	}
+	return flat, resumeIndex, base, nil
+}
+
+// FitToSize returns the largest prefix of flat[resumeIndex:] (with any
+// offset pointer that would reach past the cut rewritten to an absolute
+// "<baseExpression>@<index>" continuation pointer) such that
+// measure(prefix) <= maxSize. measure should return the byte size of
+// whatever message envelope the caller will actually send containing that
+// prefix as its nodes (e.g. a whole marshaled NodeTreeMessage{Response{...}}).
+// truncated reports whether the full remainder didn't fit (i.e. whether a
+// continuation pointer had to be generated).
+//
+// This mirrors the offset-rewrite design in the repo's Python reference
+// implementation (common.py's build_response_for_mss): offsets are deltas
+// (target index - current index), so they stay valid wherever a
+// contiguous run of them ends up, but a node included in the window can
+// point past it -- exactly the case this rewrites.
+func FitToSize(flat []wire.Node, resumeIndex int, baseExpression string, maxSize int, measure func([]wire.Node) int) (window []wire.Node, truncated bool) {
+	windowTotal := len(flat) - resumeIndex
+	for n := windowTotal; n > 0; n-- {
+		candidate := fixupWindow(flat, resumeIndex, n, baseExpression)
+		if measure(candidate) <= maxSize {
+			return candidate, n < windowTotal
+		}
+	}
+	return nil, windowTotal > 0
+}
+
+// fixupWindow copies flat[resumeIndex:resumeIndex+n] and rewrites any
+// firstChild/nextSibling offset pointer that would land at or past the
+// window's end into an absolute continuation pointer instead.
+func fixupWindow(flat []wire.Node, resumeIndex, n int, baseExpression string) []wire.Node {
+	endGlobal := resumeIndex + n
+	included := make([]wire.Node, n)
+	copy(included, flat[resumeIndex:endGlobal]) // value copy: safe to mutate included[i] without touching flat
+
+	for j := range included {
+		iGlobal := resumeIndex + j
+		for _, field := range []*wire.NodePointer{&included[j].FirstChild, &included[j].NextSibling} {
+			if field.Kind != wire.PointerOffset || field.Offset == 0 {
+				continue // not a pointer, or the "none" sentinel
+			}
+			targetGlobal := iGlobal + int(field.Offset)
+			if targetGlobal >= endGlobal {
+				*field = wire.AbsolutePointer(fmt.Sprintf("%s@%d", baseExpression, targetGlobal))
+			}
+		}
+	}
+	return included
 }
 
 // FindOne resolves `expression` to exactly one live tree Node (for Set's

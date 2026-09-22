@@ -71,18 +71,39 @@ Note: flags must come *before* the positional expression (Go's `flag`
 package stops parsing at the first non-flag argument) --
 `set --value X "/expr"`, not `set "/expr" --value X`.
 
+### Demoing truncation and continuations
+
+Like the Python/UDP side, a `Get` result that doesn't fit in one QUIC
+datagram is truncated, with `firstChild`/`nextSibling` pointers that
+would reach past the cut rewritten to an absolute `<expression>@<index>`
+continuation pointer (`tree.FitToSize`); `client.go`'s `followGet`
+resolves them automatically. A `Query` push that doesn't fit is handled
+differently: those nodes are independent results with no
+`firstChild`/`nextSibling` relationships worth preserving (`sessionResultSink.DeliverResults`
+always gives each one a trivial "none"/"none"), so `sendBatched` just
+splits them across multiple `Response` messages instead of generating
+continuation pointers -- no query-language concept to resume from is
+needed there. `quic-go` has no proactive "max datagram size" query -- the
+server discovers it reactively, from the `quic.DatagramTooLargeError` a
+real oversized send returns -- so on a real network path the limit is far
+larger than this demo's small tree would ever exceed. Force it low to see
+`Get` truncation happen:
+
+```bash
+go run ./cmd/server --max-datagram-size 60
+go run ./cmd/client get "/users"
+```
+
+```
+get: 1 node(s)
+    key="users" value=(none) firstChild=-> "/users@1" nextSibling=-> "/users@3"
+get (continuation of "/users@1"): 1 node(s)
+    key="user" value="alice" firstChild=none nextSibling=-> "/users@2"
+...
+```
+
 ## Known gaps (honestly, not swept under the rug)
 
-- **No MSS-based truncation/continuation.** The Python/UDP reference
-  implementation (see the repo root README) splits an oversized `Response`
-  across multiple datagrams with `<expression>@<index>` continuation
-  pointers. That logic was *not* ported here -- a `Get`/`Query` result
-  that doesn't fit in one QUIC datagram currently just fails to send
-  (`DATAGRAM frame too large`, logged, retried up to `maxRetransmits`,
-  then given up on -- confirmed by testing `get "/Sessions"` against a
-  server that had accumulated many prior test sessions). This is a real,
-  scoped-out gap, not a subtle bug: the same continuation-pointer design
-  used on the UDP side would work here too and is the natural next step.
 - **No real mTLS.** `internal/certs` generates a throwaway self-signed
   certificate, and the client sets `InsecureSkipVerify`. See the parent
   conversation's mTLS design discussion (TCP+TLS vs. DTLS vs. QUIC's own
