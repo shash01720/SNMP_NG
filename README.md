@@ -69,24 +69,60 @@ python3 server.py
 In another terminal, query it:
 
 ```bash
-python3 client.py "/users/alice"
-python3 client.py "/users/.*=user"
+python3 client.py "/users"
+python3 client.py "/users/user=alice"
 python3 client.py "/config"
 python3 client.py "/nonexistent"
 ```
 
-The demo data ([demo_data.json](demo_data.json)) is:
+### Demo data: plain JSON, tree derived from it
+
+[demo_data.json](demo_data.json) is ordinary JSON — it has no idea of
+"key"/"value"/"children" of its own:
+
+```json
+{
+  "users": [
+    {"user": "alice", "group": "admin"},
+    {"user": "bob", "group": "user"},
+    {"user": "carol", "group": "user"}
+  ],
+  "config": {
+    "timeout": 30,
+    "retries": 3
+  }
+}
+```
+
+[demo_data.py](demo_data.py) derives the `Node` tree from its structure
+and attribute names alone (see its docstring for the full rule): an
+object's properties each become a node keyed by the property name; an
+array is *transparent* and adds no node of its own — each element
+becomes node(s) reusing the array's own key, so an array of objects
+becomes one sibling node per element (each with that element's own
+properties as children), not one node listing them all. That turns the
+JSON above into:
 
 ```
-root
+/
 ├── users
-│   ├── alice = "admin"
-│   ├── bob   = "user"
-│   └── carol = "user"
+│   ├── user = "alice"
+│   └── group = "admin"
+├── users
+│   ├── user = "bob"
+│   └── group = "user"
+├── users
+│   ├── user = "carol"
+│   └── group = "user"
 └── config
     ├── timeout = "30"
     └── retries = "3"
 ```
+
+The three `users` nodes are siblings of each other and of `config`, not
+children of one shared "users" node — so `/users` matches all three
+(and returns each one's full subtree), while `/users/user=alice`
+matches only the `user` leaf of the first one.
 
 ### Demoing truncation and continuations
 
@@ -95,22 +131,27 @@ real-world MSS, so truncation won't trigger on its own. Force a tiny
 MSS on the server to see it in action:
 
 ```bash
-python3 server.py --mss 45
+python3 server.py --mss 90
 python3 client.py "/users"
 ```
 
 The client will show the response arriving in several batches, each one
-following the continuation pointer from the last, e.g.:
+following the continuation pointer from the last — here each batch
+happens to be exactly one full user record (`users`, `user`, `group`):
 
 ```
--- response (1 node(s)) --
-    key='users' value=b'' firstChild=-> '/users@1' nextSibling=none
--- continuation of '/users@1' (1 node(s)) --
-    key='alice' value=b'admin' firstChild=none nextSibling=-> '/users@2'
--- continuation of '/users@2' (1 node(s)) --
-    key='bob' value=b'user' firstChild=none nextSibling=-> '/users@3'
--- continuation of '/users@3' (1 node(s)) --
-    key='carol' value=b'user' firstChild=none nextSibling=none
+-- response (3 node(s)) --
+    key='users' value=b'' firstChild=+1 nextSibling=-> '/users@3'
+    key='user' value=b'alice' firstChild=none nextSibling=+1
+    key='group' value=b'admin' firstChild=none nextSibling=none
+-- continuation of '/users@3' (3 node(s)) --
+    key='users' value=b'' firstChild=+1 nextSibling=-> '/users@6'
+    key='user' value=b'bob' firstChild=none nextSibling=+1
+    key='group' value=b'user' firstChild=none nextSibling=none
+-- continuation of '/users@6' (3 node(s)) --
+    key='users' value=b'' firstChild=+1 nextSibling=none
+    key='user' value=b'carol' firstChild=none nextSibling=+1
+    key='group' value=b'user' firstChild=none nextSibling=none
 ```
 
 Without `--mss`, the server tries to discover a real MSS from the
@@ -126,36 +167,40 @@ of each datagram's UDP payload as it's sent or received — the exact
 bytes exchanged, in the exact order:
 
 ```bash
-python3 server.py --mss 45 --pcap
+python3 server.py --mss 90 --pcap
 python3 client.py "/users" --pcap
 ```
 
 This is the **real captured output** from that exact command (the
-sequence below is a `Get "/users"` truncated at `--mss 45` into four
-request/response round trips):
+sequence below is a `Get "/users"` truncated at `--mss 90` into three
+request/response round trips, one user record per datagram):
 
 ```
-19:22:26.099963 IP 127.0.0.1.59596 > 127.0.0.1.8514: UDP, length 12
+19:43:52.416835 IP 127.0.0.1.58199 > 127.0.0.1.8514: UDP, length 12
 	0x0000:  300a a008 8006 2f75 7365 7273            0...../users
-19:22:26.100746 IP 127.0.0.1.8514 > 127.0.0.1.59596: UDP, length 30
-	0x0000:  301c 301a 8005 7573 6572 7381 00a2 0a80  0.0...users.....
-	0x0010:  082f 7573 6572 7340 31a3 0381 0100       ./users@1.....
-19:22:26.100808 IP 127.0.0.1.59596 > 127.0.0.1.8514: UDP, length 14
-	0x0000:  300c a00a 8008 2f75 7365 7273 4031       0...../users@1
-19:22:26.101150 IP 127.0.0.1.8514 > 127.0.0.1.59596: UDP, length 35
-	0x0000:  3021 301f 8005 616c 6963 6581 0561 646d  0!0...alice..adm
-	0x0010:  696e a203 8101 00a3 0a80 082f 7573 6572  in........./user
-	0x0020:  7340 32                                  s@2
-19:22:26.101218 IP 127.0.0.1.59596 > 127.0.0.1.8514: UDP, length 14
-	0x0000:  300c a00a 8008 2f75 7365 7273 4032       0...../users@2
-19:22:26.101560 IP 127.0.0.1.8514 > 127.0.0.1.59596: UDP, length 32
-	0x0000:  301e 301c 8003 626f 6281 0475 7365 72a2  0.0...bob..user.
-	0x0010:  0381 0100 a30a 8008 2f75 7365 7273 4033  ......../users@3
-19:22:26.101611 IP 127.0.0.1.59596 > 127.0.0.1.8514: UDP, length 14
+19:43:52.417884 IP 127.0.0.1.8514 > 127.0.0.1.58199: UDP, length 81
+	0x0000:  304f 301a 8005 7573 6572 7381 00a2 0381  0O0...users.....
+	0x0010:  0101 a30a 8008 2f75 7365 7273 4033 3017  ....../users@30.
+	0x0020:  8004 7573 6572 8105 616c 6963 65a2 0381  ..user..alice...
+	0x0030:  0100 a303 8101 0130 1880 0567 726f 7570  .......0...group
+	0x0040:  8105 6164 6d69 6ea2 0381 0100 a303 8101  ..admin.........
+	0x0050:  00                                       .
+19:43:52.417991 IP 127.0.0.1.58199 > 127.0.0.1.8514: UDP, length 14
 	0x0000:  300c a00a 8008 2f75 7365 7273 4033       0...../users@3
-19:22:26.101960 IP 127.0.0.1.8514 > 127.0.0.1.59596: UDP, length 27
-	0x0000:  3019 3017 8005 6361 726f 6c81 0475 7365  0.0...carol..use
-	0x0010:  72a2 0381 0100 a303 8101 00              r..........
+19:43:52.418498 IP 127.0.0.1.8514 > 127.0.0.1.58199: UDP, length 78
+	0x0000:  304c 301a 8005 7573 6572 7381 00a2 0381  0L0...users.....
+	0x0010:  0101 a30a 8008 2f75 7365 7273 4036 3015  ....../users@60.
+	0x0020:  8004 7573 6572 8103 626f 62a2 0381 0100  ..user..bob.....
+	0x0030:  a303 8101 0130 1780 0567 726f 7570 8104  .....0...group..
+	0x0040:  7573 6572 a203 8101 00a3 0381 0100       user..........
+19:43:52.418572 IP 127.0.0.1.58199 > 127.0.0.1.8514: UDP, length 14
+	0x0000:  300c a00a 8008 2f75 7365 7273 4036       0...../users@6
+19:43:52.419018 IP 127.0.0.1.8514 > 127.0.0.1.58199: UDP, length 73
+	0x0000:  3047 3013 8005 7573 6572 7381 00a2 0381  0G0...users.....
+	0x0010:  0101 a303 8101 0030 1780 0475 7365 7281  .......0...user.
+	0x0020:  0563 6172 6f6c a203 8101 00a3 0381 0101  .carol..........
+	0x0030:  3017 8005 6772 6f75 7081 0475 7365 72a2  0...group..user.
+	0x0040:  0381 0100 a303 8101 00                   .........
 ```
 
 Decoding the first request (`30 0a a0 08 80 06 2f 75 73 65 72 73`) by
@@ -192,7 +237,7 @@ sudo tcpdump -i lo0 -n udp port 8514 -w nodetree.pcap
 |---|---|
 | [node.asn](node.asn) | ASN.1 schema: `Node`, `NodePointer`, `Get`, `Response` |
 | [common.py](common.py) | BER encode/decode, MSS discovery, expression parsing/matching, tree flattening, MSS-fit truncation, pcap-style dump formatting |
-| [demo_data.json](demo_data.json) | Sample tree data |
-| [demo_data.py](demo_data.py) | Loads `demo_data.json` into the in-memory tree structure |
+| [demo_data.json](demo_data.json) | Sample data, as plain JSON |
+| [demo_data.py](demo_data.py) | Derives the in-memory `Node` tree from `demo_data.json`'s structure and attribute names |
 | [server.py](server.py) | UDP server: resolves `Get` requests against the demo tree |
 | [client.py](client.py) | UDP client: sends a `Get`, follows continuation pointers, prints the result |
