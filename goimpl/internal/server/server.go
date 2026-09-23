@@ -270,8 +270,8 @@ func (sess *Session) respondAndCache(requestSeq int64, resp *wire.Response) {
 // is truncated via tree.FitToSize (rewriting the offset pointer(s) that
 // would have reached past the cut into an absolute
 // "<baseExpression>@<index>" continuation pointer the client can Get to
-// resume) -- see node.asn's NodePointer docs and the repo's Python/UDP
-// reference implementation, which this mirrors.
+// resume) -- see node.asn's NodePointer docs and the earlier Python/UDP
+// prototype this mirrors.
 //
 // The datagram size budget is learned reactively: quic-go has no proactive
 // "max datagram size" query, only a quic.DatagramTooLargeError returned

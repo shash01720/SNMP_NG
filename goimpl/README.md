@@ -5,9 +5,12 @@ in [`../node.asn`](../node.asn): `Get`, `Set`, `Create`, `Query`, typed
 `NodeValue`s, and a reliable-but-**unordered** delivery layer built on
 QUIC's unreliable DATAGRAM extension ([RFC 9221](https://www.rfc-editor.org/rfc/rfc9221.html)).
 
-This is a distinct protocol version from the Python UDP reference
-implementation at the repo root (`client.py`/`server.py`/`common.py`),
-documented as such in `node.asn` -- they are not wire-compatible.
+This is a distinct protocol version from the Python/UDP prototype that
+proved out the core design before `node.asn` was extended (documented as
+such in `node.asn`'s header comment) -- they were never wire-compatible,
+and that prototype has since been removed as superseded. Several design
+comments below still cite it by name (e.g. `common.py`) as provenance for
+where a piece of this Go implementation's design came from.
 
 ## Why QUIC datagrams instead of streams
 
@@ -35,7 +38,7 @@ Noise-based crypto).
 | Package | Purpose |
 |---|---|
 | `internal/wire` | Hand-written BER codec for every node.asn message type, verified against real `asn1tools`-encoded fixtures (`testdata_fixtures.json`) -- not `encoding/asn1` struct tags, which don't cleanly express this schema's mix of IMPLICIT/EXPLICIT-on-CHOICE tagging (see the package doc comment for why) |
-| `internal/tree` | The in-memory Node tree, match-expression parser/evaluator, flattening, and `Set`'s delete-by-relink semantics -- a port of the proven design in the repo's Python `common.py` |
+| `internal/tree` | The in-memory Node tree, match-expression parser/evaluator, flattening, and `Set`'s delete-by-relink semantics -- a port of the design proven out in the (now-removed) Python prototype's `common.py` |
 | `internal/reliability` | `SummaryAck`-based ack/retransmit over QUIC datagrams |
 | `internal/query` | `Query`'s collect/aggregate/transfer pipeline and aggregation math (min/max/mean/stdDev/percentile) |
 | `internal/server` | Session management (one per QUIC connection), message dispatch, error-node generation |
@@ -104,8 +107,8 @@ that mechanism alongside the forced demo below.
 
 ### Demoing truncation and continuations
 
-Like the Python/UDP side, a `Get` result that doesn't fit in one QUIC
-datagram is truncated, with `firstChild`/`nextSibling` pointers that
+Like the earlier Python/UDP prototype this design was proven out in, a
+`Get` result that doesn't fit in one QUIC datagram is truncated, with `firstChild`/`nextSibling` pointers that
 would reach past the cut rewritten to an absolute `<expression>@<index>`
 continuation pointer (`tree.FitToSize`); `client.go`'s `followGet`
 resolves them automatically. A `Query` push that doesn't fit is handled
@@ -165,7 +168,8 @@ go test ./...
 
 `internal/wire`'s tests are the most important ones to trust: they check
 this codec's output byte-for-byte against `testdata_fixtures.json`, which
-is generated independently by the Python/`asn1tools` reference
-implementation (see the repo root's tooling) -- not just that this
-package's own Marshal/Unmarshal agree with each other, but that they
-match what `node.asn`'s AUTOMATIC TAGS numbering actually produces.
+`generate_fixtures.py` produces independently by compiling `node.asn`
+directly with the Python `asn1tools` library (not via anything in this
+Go module) -- not just that this package's own Marshal/Unmarshal agree
+with each other, but that they match what `node.asn`'s AUTOMATIC TAGS
+numbering actually produces.

@@ -1,8 +1,9 @@
 // Package tree is the in-memory Node tree: construction, the NodePointer
 // match-expression parser/evaluator, and flattening a match into wire.Node
 // values with offset pointers -- a direct port of the design proven out in
-// the repo's Python reference implementation (common.py), adapted for
-// wire.NodeValue instead of a bare byte string.
+// this project's earlier Python/UDP prototype (its common.py, since
+// removed as superseded), adapted for wire.NodeValue instead of a bare
+// byte string.
 package tree
 
 import (
@@ -42,7 +43,7 @@ func AppendChild(parent, child *Node) {
 	parent.Children = append(parent.Children, child)
 }
 
-// --- match-expression parsing (identical grammar to the Python reference) -
+// --- match-expression parsing (identical grammar to the earlier prototype) -
 //
 //	request    = expression ["@" resume-index]
 //	expression = 1*( ["/"] key-regexp ["=" value-regexp] )
@@ -209,8 +210,8 @@ func valueAsText(v wire.NodeValue) string {
 // top-level matches are then chained to each other via nextSibling (even
 // though they usually aren't real tree-siblings), so a later match that
 // doesn't fit a size budget still gets a continuation instead of silently
-// vanishing -- exactly the design proven out in the Python reference
-// implementation's common.py.
+// vanishing -- exactly the design proven out in the earlier Python/UDP
+// prototype's common.py.
 
 func FlattenMatches(matches []*Node) []wire.Node {
 	var out []wire.Node
@@ -312,8 +313,8 @@ func (t *Tree) GetFull(expression string) (flat []wire.Node, resumeIndex int, ba
 // truncated reports whether the full remainder didn't fit (i.e. whether a
 // continuation pointer had to be generated).
 //
-// This mirrors the offset-rewrite design in the repo's Python reference
-// implementation (common.py's build_response_for_mss): offsets are deltas
+// This mirrors the offset-rewrite design in the earlier Python/UDP
+// prototype (its common.py's build_response_for_mss): offsets are deltas
 // (target index - current index), so they stay valid wherever a
 // contiguous run of them ends up, but a node included in the window can
 // point past it -- exactly the case this rewrites.

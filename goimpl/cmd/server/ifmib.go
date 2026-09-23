@@ -16,8 +16,7 @@ import (
 // carried through verbatim: real MAC addresses (ifPhysAddress) are
 // replaced with deterministic, clearly-synthetic ones in the
 // locally-administered range. This is a copy of the repo root's
-// ifmib_dump.json (also used by the Python reference implementation's
-// demo_data.json), embedded here rather than read at runtime so the
+// ifmib_dump.json, embedded here rather than read at runtime so the
 // server doesn't depend on its working directory.
 //
 //go:embed ifmib_dump.json

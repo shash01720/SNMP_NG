@@ -9,10 +9,11 @@ NodeTree DEFINITIONS AUTOMATIC TAGS ::= BEGIN
 -- protocol over QUIC, using QUIC's unreliable DATAGRAM extension
 -- (RFC 9221) as the substrate for an application-level reliable-but-
 -- UNORDERED delivery layer (see SummaryAck below). The earlier Python
--- UDP client/server (client.py/server.py/common.py) implement the prior
--- schema version and are NOT wire-compatible with this one; they are
--- kept as-is rather than ported, since this revision is a distinct,
--- QUIC-based implementation (see goimpl/).
+-- UDP prototype that proved out the core design (match expressions,
+-- pre-order flattening, MSS truncation/continuation) implemented the
+-- prior schema version and was never wire-compatible with this one; it
+-- has since been removed as superseded (see goimpl/, the Go/QUIC
+-- implementation this schema now serves).
 --
 -- Every message that carries application data (Get, Set, Create, Query,
 -- Response) carries its own `sequenceNumber`, monotonically increasing
