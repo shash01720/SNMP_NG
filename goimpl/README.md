@@ -1,16 +1,9 @@
 # NodeTree over QUIC (Go)
 
-A from-scratch Go implementation of the extended NodeTree protocol defined
-in [`../node.asn`](../node.asn): `Get`, `Set`, `Create`, `Query`, typed
+A Go implementation of the NodeTree protocol defined in
+[`../node.asn`](../node.asn): `Get`, `Set`, `Create`, `Query`, typed
 `NodeValue`s, and a reliable-but-**unordered** delivery layer built on
 QUIC's unreliable DATAGRAM extension ([RFC 9221](https://www.rfc-editor.org/rfc/rfc9221.html)).
-
-This is a distinct protocol version from the Python/UDP prototype that
-proved out the core design before `node.asn` was extended (documented as
-such in `node.asn`'s header comment) -- they were never wire-compatible,
-and that prototype has since been removed as superseded. Several design
-comments below still cite it by name (e.g. `common.py`) as provenance for
-where a piece of this Go implementation's design came from.
 
 ## Why QUIC datagrams instead of streams
 
