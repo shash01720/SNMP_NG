@@ -1,22 +1,4 @@
 {
-  "users": [
-    {
-      "user": "alice",
-      "group": "admin"
-    },
-    {
-      "user": "bob",
-      "group": "user"
-    },
-    {
-      "user": "carol",
-      "group": "user"
-    }
-  ],
-  "config": {
-    "timeout": 30,
-    "retries": 3
-  },
   "interfaces": [
     {
       "ifIndex": 1,

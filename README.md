@@ -4,6 +4,19 @@ A small tree-structured key/value store and a GET protocol for querying
 it, defined in ASN.1 ([node.asn](node.asn)) and implemented as a
 reference UDP client/server in Python.
 
+> **Status: this Python client/server is currently wire-incompatible with
+> `node.asn`.** The schema was later extended (`Set`/`Create`/`Query`,
+> typed `NodeValue`, a structured `Response`) for a separate Go/QUIC
+> implementation ([`goimpl/`](goimpl/)), which *is* schema-current and
+> actively maintained. `common.py`/`client.py`/`server.py` here were
+> never migrated to match — `client.py get ...` currently fails with an
+> encode error (`Get: Sequence member 'sequenceNumber' not found`). The
+> demo data below (including the new `interfaces` section) is verified
+> correct as *data* (loads cleanly via `demo_data.py`), but hasn't been
+> exercised over the wire on this side since that schema change. See
+> [`goimpl/README.md`](goimpl/README.md) for the maintained, working
+> implementation.
+
 ## Schema
 
 [node.asn](node.asn) defines:
@@ -123,6 +136,29 @@ The three `users` nodes are siblings of each other and of `config`, not
 children of one shared "users" node — so `/users` matches all three
 (and returns each one's full subtree), while `/users/user=alice`
 matches only the `user` leaf of the first one.
+
+### Real IF-MIB data under `/interfaces`
+
+`demo_data.json` also carries a third, richer top-level key: `interfaces`,
+23 records taken from a **real** `snmpbulkwalk` of IF-MIB's `ifTable`
+(RFC 2863), run against a real, locally-started `snmpd` — not fabricated.
+[`parse_ifmib_dump.py`](parse_ifmib_dump.py) turns the raw walk into
+[`ifmib_dump.json`](ifmib_dump.json) (which is what got merged into
+`demo_data.json`); its docstring documents the exact commands used, for
+reproducibility. The only field not carried through verbatim is
+`ifPhysAddress` — real MAC addresses are replaced with deterministic,
+clearly-synthetic ones (the `02:00:00:xx:xx:xx` locally-administered
+range) rather than exposing this machine's actual hardware addresses.
+Every other field (interface name, type, MTU, speed, admin/oper status,
+and every packet/octet/error counter) is the genuine captured value.
+
+Since `demo_data.py`'s derivation is generic (driven entirely by JSON
+structure and attribute names, not a fixed schema), this needed no new
+code on the Python side — it's a good stress test of that design with
+real-shaped data: 23 `interfaces` sibling nodes (one per network
+interface), each with ~19 typed-looking fields as children (though on
+this schema version every value is still an opaque string — see the
+status note at the top of this README for where typed values live).
 
 ### Demoing truncation and continuations
 
@@ -281,7 +317,9 @@ sudo tcpdump -i lo0 -n udp port 8514 -w nodetree.pcap
 |---|---|
 | [node.asn](node.asn) | ASN.1 schema: `Node`, `NodePointer`, `Get`, `Response` |
 | [common.py](common.py) | BER encode/decode, MSS discovery, expression parsing/matching, tree flattening, MSS-fit truncation, JSON reconstruction, pcap-style dump formatting |
-| [demo_data.json](demo_data.json) | Sample data, as plain JSON |
+| [demo_data.json](demo_data.json) | Sample data, as plain JSON (`users`/`config` toy data, plus a real IF-MIB `interfaces` capture) |
+| [ifmib_dump.json](ifmib_dump.json) | The real IF-MIB capture on its own, as merged into `demo_data.json`'s `interfaces` key |
+| [parse_ifmib_dump.py](parse_ifmib_dump.py) | Turns a raw `snmpbulkwalk` capture into `ifmib_dump.json` (MAC-anonymized); its docstring documents the exact capture commands |
 | [demo_data.py](demo_data.py) | Derives the in-memory `Node` tree from `demo_data.json`'s structure and attribute names |
 | [server.py](server.py) | UDP server: resolves `Get` requests against the demo tree |
 | [client.py](client.py) | UDP client: sends a `Get`, follows continuation pointers, prints the result; `--json`/`--compare` reconstruct JSON and verify it against a reference file |

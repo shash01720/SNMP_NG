@@ -50,6 +50,7 @@ func main() {
 	srv := server.New()
 	srv.MaxDatagramSizeOverride = *maxDatagramSize
 	seedDemoData(srv)
+	seedIfMib(srv)
 
 	log.Printf("[server] listening on %s (QUIC)%s", *addr, overrideSuffix(*maxDatagramSize))
 	if err := srv.Run(ctx, ln); err != nil {

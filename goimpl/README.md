@@ -40,7 +40,7 @@ Noise-based crypto).
 | `internal/query` | `Query`'s collect/aggregate/transfer pipeline and aggregation math (min/max/mean/stdDev/percentile) |
 | `internal/server` | Session management (one per QUIC connection), message dispatch, error-node generation |
 | `internal/certs` | Throwaway self-signed TLS cert for the demo (QUIC mandates TLS 1.3) -- not a real mTLS story, see below |
-| `cmd/server`, `cmd/client` | CLI binaries |
+| `cmd/server`, `cmd/client` | CLI binaries -- `cmd/server` also embeds and seeds a real IF-MIB dataset, see below |
 
 ## Running the demo
 
@@ -70,6 +70,37 @@ go run ./cmd/client query --collection 1 --agg-interval 3 --agg-method mean --tr
 Note: flags must come *before* the positional expression (Go's `flag`
 package stops parsing at the first non-flag argument) --
 `set --value X "/expr"`, not `set "/expr" --value X`.
+
+### Real IF-MIB demo data
+
+Alongside the toy `users`/`config` tree, the server seeds a second,
+richer dataset under `/interfaces`: 23 records, one per network interface,
+taken from a **real** `snmpbulkwalk` of IF-MIB's `ifTable` (RFC 2863) run
+against a real, locally-started `snmpd` -- not fabricated. See
+[`../parse_ifmib_dump.py`](../parse_ifmib_dump.py) for how the raw walk
+was turned into [`../ifmib_dump.json`](../ifmib_dump.json) (embedded here
+as `cmd/server/ifmib_dump.json`); the only thing not carried through
+verbatim is `ifPhysAddress` -- real MAC addresses are replaced with
+deterministic, clearly-synthetic ones (the `02:00:00:xx:xx:xx`
+locally-administered range) rather than exposing this machine's actual
+hardware addresses.
+
+Each interface's fields are typed per real IF-MIB column semantics --
+`Integer32` for `ifIndex`/`ifType`/`ifMtu`/`ifAdminStatus`/`ifOperStatus`,
+`Unsigned32` for `ifSpeed` (`Gauge32` in the real MIB), `TimeTicks` for
+`ifLastChangeTicks`, `Counter32` for every packet/octet/error counter,
+`OctetString` for `ifDescr`/`ifPhysAddress` -- a good demonstration of the
+typed `NodeValue` system beyond the toy demo's plain strings/ints:
+
+```bash
+go run ./cmd/client get "/interfaces/ifDescr=en0"
+go run ./cmd/client get "/interfaces/ifDescr=.*"   # every interface name
+```
+
+`get "/interfaces"` (the whole table) is large enough that it naturally
+triggers truncation/continuation on a real connection, no
+`--max-datagram-size` override needed -- a good real-world exercise of
+that mechanism alongside the forced demo below.
 
 ### Demoing truncation and continuations
 

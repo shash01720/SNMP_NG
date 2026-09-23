@@ -1,0 +1,4 @@
+# Raw snmpbulkwalk capture: contains real local hardware MAC addresses
+# in plaintext. See parse_ifmib_dump.py's docstring for how to regenerate
+# it locally; only its anonymized output (ifmib_dump.json) is committed.
+ifmib_raw.txt
