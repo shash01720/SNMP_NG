@@ -5,15 +5,6 @@ in ASN.1 ([node.asn](node.asn)) and implemented in Go over QUIC
 ([`goimpl/`](goimpl/) — see its README for setup, usage, and design
 notes).
 
-An earlier Python/UDP prototype (`client.py`/`server.py`/`common.py`)
-proved out the core design — the match-expression language, pre-order
-tree flattening with offset pointers, and MSS-based truncation with
-`<expression>@<index>` continuation pointers — before `node.asn` was
-extended (`Set`/`Create`/`Query`, typed `NodeValue`, `SummaryAck`
-reliability) for the Go/QUIC implementation. That prototype has been
-removed now that it's superseded; several of `goimpl/`'s design comments
-still reference it by name as design provenance.
-
 ## Schema
 
 [node.asn](node.asn) defines the wire protocol:
@@ -59,19 +50,17 @@ the Go server (`goimpl/cmd/server/ifmib_dump.json`, `go:embed`) and
 seeded under `/interfaces`, with every field typed per real IF-MIB column
 semantics.
 
-[parse_ifmib_dump.py](parse_ifmib_dump.py) is the (still-Python, but a
-standalone data-prep utility rather than a protocol implementation)
-script that produced `ifmib_dump.json` from the raw walk. Its docstring
-documents the exact capture commands, for reproducibility. One field
-isn't carried through verbatim: real MAC addresses (`ifPhysAddress`) are
-replaced with deterministic, clearly-synthetic ones (the
-`02:00:00:xx:xx:xx` locally-administered range) rather than committing
-this machine's actual hardware addresses. Everything else (interface
-name, type, MTU, speed, admin/oper status, every packet/octet/error
-counter) is the genuine captured value. The raw capture itself was never
-committed (it has real MACs in plaintext before this script's
-anonymization step); regenerate your own locally if you want to re-run
-the script end to end.
+[parse_ifmib_dump.py](parse_ifmib_dump.py) is the script that produced
+`ifmib_dump.json` from the raw walk. Its docstring documents the exact
+capture commands, for reproducibility. One field isn't carried through
+verbatim: real MAC addresses (`ifPhysAddress`) are replaced with
+deterministic, clearly-synthetic ones (the `02:00:00:xx:xx:xx`
+locally-administered range) rather than committing this machine's actual
+hardware addresses. Everything else (interface name, type, MTU, speed,
+admin/oper status, every packet/octet/error counter) is the genuine
+captured value. The raw capture itself was never committed (it has real
+MACs in plaintext before this script's anonymization step); regenerate
+your own locally if you want to re-run the script end to end.
 
 ## Files
 
