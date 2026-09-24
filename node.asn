@@ -341,5 +341,22 @@ NodeTreeMessage ::= CHOICE {
 -- an unescaped "=", which the expression grammar above treats as a
 -- key/value delimiter; write it as "Connection-ID\=<session-id>" in an
 -- expression.
+--
+-- Each Query, on registration (before its first push, if any), gets its
+-- own subcontainer under QueryResults, holding only that query's pushed
+-- results:
+--
+--     .../QueryResults/Query-SequenceNumber=<query's own sequenceNumber>
+--
+-- Deleting that node (an ordinary Delete targeting it, or a broader
+-- Delete/Set that detaches it or an ancestor of it, e.g. QueryResults
+-- itself) cancels the query: the server stops its collect/aggregate/
+-- transfer goroutine, same as if the session had disconnected. This is
+-- per-query cancellation without a dedicated message: a client that
+-- wants to stop watching something was already going to want its
+-- accumulated results gone too, and Delete already exists and already
+-- means "make this go away." A completed ONCE query has no goroutine
+-- left to cancel; deleting its results node after the fact is just
+-- ordinary cleanup.
 
 END

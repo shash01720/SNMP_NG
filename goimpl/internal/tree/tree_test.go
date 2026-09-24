@@ -519,6 +519,75 @@ func TestDeleteOverlappingTargetsDeduplicates(t *testing.T) {
 	}
 }
 
+// --- IsReachable --------------------------------------------------------
+
+func TestIsReachableRootAndLiveNodes(t *testing.T) {
+	tr := demoTree()
+	if !tr.IsReachable(tr.Root) {
+		t.Fatal("Root should be reachable from itself")
+	}
+	config, err := tr.FindOne("/config")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !tr.IsReachable(config) {
+		t.Fatal("/config should be reachable")
+	}
+	timeout := config.Children[0]
+	if !tr.IsReachable(timeout) {
+		t.Fatal("/config/timeout should be reachable")
+	}
+}
+
+// TestIsReachableAfterDelete checks the direct case: a node just removed
+// by Delete is no longer reachable.
+func TestIsReachableAfterDelete(t *testing.T) {
+	tr := demoTree()
+	config, err := tr.FindOne("/config")
+	if err != nil {
+		t.Fatal(err)
+	}
+	timeout := config.Children[0]
+	if _, err := tr.Delete([]string{"/config/timeout"}); err != nil {
+		t.Fatal(err)
+	}
+	if tr.IsReachable(timeout) {
+		t.Fatal("deleted node should no longer be reachable")
+	}
+}
+
+// TestIsReachableAfterAncestorDelete checks the indirect case this was
+// actually built for: a node whose ANCESTOR was deleted (not the node
+// itself) must also read as unreachable, even though its own .Parent
+// field still points at the (now-detached) ancestor -- see removeChild,
+// which never clears a removed node's Parent field.
+func TestIsReachableAfterAncestorDelete(t *testing.T) {
+	tr := demoTree()
+	stagingRoot := &Node{Key: "NewNodes"}
+	AppendChild(tr.Root, stagingRoot)
+	parent, err := tr.CreateStaged(stagingRoot, "", "parent", wire.NoValue())
+	if err != nil {
+		t.Fatal(err)
+	}
+	child, err := tr.CreateStaged(stagingRoot, "/NewNodes/parent", "child", wire.NoValue())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !tr.IsReachable(child) {
+		t.Fatal("child should be reachable before its ancestor is deleted")
+	}
+
+	if _, err := tr.Delete([]string{"/NewNodes/parent"}); err != nil {
+		t.Fatal(err)
+	}
+	if child.Parent != parent {
+		t.Fatalf("child.Parent = %+v, want unchanged (removeChild doesn't clear it)", child.Parent)
+	}
+	if tr.IsReachable(child) {
+		t.Fatal("child should no longer be reachable once its ancestor was deleted, despite child.Parent still pointing at it")
+	}
+}
+
 // --- FitToSize / continuation ---------------------------------------------
 
 // byteMeasure is a stand-in "how big would this be on the wire" function

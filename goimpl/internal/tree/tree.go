@@ -419,6 +419,28 @@ func (t *Tree) FindAll(expression string) ([]*Node, error) {
 	return Evaluate(t.Root, segments), nil
 }
 
+// IsReachable reports whether node is still part of the live tree (Root
+// itself, or a descendant of it). A node detached by Delete or by Set's
+// newFirstChild/newNextSibling/newParent keeps its own Parent field
+// pointing at its old parent -- nothing clears it, see removeChild/
+// relinkFirstChild/relinkNextSibling -- so merely walking the Parent
+// chain up to Root proves nothing: a detached subtree's internal Parent
+// pointers still lead there. What actually distinguishes "still attached"
+// from "was cut loose" is whether each node in that chain is still
+// present in its claimed parent's own Children slice; a node one level
+// up the chain being missing from ITS parent's Children (not node's own)
+// is exactly the "ancestor got deleted" case this exists to catch.
+func (t *Tree) IsReachable(node *Node) bool {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	for n := node; n != t.Root; n = n.Parent {
+		if n.Parent == nil || indexOfChild(n.Parent, n) < 0 {
+			return false
+		}
+	}
+	return true
+}
+
 // EnsurePath walks (creating as needed) a chain of container nodes
 // key1/key2/... under the tree root, returning the final node. Used to
 // materialize the "/Sessions/Connection-ID=<id>/..." virtual subtrees.

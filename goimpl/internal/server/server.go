@@ -80,6 +80,13 @@ type Session struct {
 
 	queriesMu     sync.Mutex
 	activeQueries map[int64]*query.Runner
+	// queryResultNodes tracks each active query's own results subcontainer
+	// (see node.asn's SESSION PATHS docs), so reapCancelledQueries can tell
+	// whether a Delete/Set detached it (or an ancestor of it) and, if so,
+	// cancel that query -- per-query cancellation without a dedicated
+	// message. Guarded by queriesMu alongside activeQueries, which it's
+	// always kept in sync with.
+	queryResultNodes map[int64]*tree.Node
 
 	// overrideSize is a copy of Server.MaxDatagramSizeOverride, fixed at
 	// session creation and never mutated afterward -- safe to read without
@@ -130,11 +137,12 @@ func (sess *Session) setMaxDatagramSize(n int) {
 func (s *Server) newSession(conn *quic.Conn) *Session {
 	id := randomSessionID()
 	sess := &Session{
-		ID:            id,
-		server:        s,
-		conn:          conn,
-		respCache:     make(map[int64]cachedResponse),
-		activeQueries: make(map[int64]*query.Runner),
+		ID:               id,
+		server:           s,
+		conn:             conn,
+		respCache:        make(map[int64]cachedResponse),
+		activeQueries:    make(map[int64]*query.Runner),
+		queryResultNodes: make(map[int64]*tree.Node),
 	}
 	base := s.Tree.EnsurePath("Sessions", "Connection-ID="+id)
 	sess.newNodesPath = s.Tree.EnsurePath0(base, "NewNodes")
@@ -453,6 +461,7 @@ func (sess *Session) handleSet(s *wire.Set) {
 		sess.respondError(s.SequenceNumber, errInvalidSet, err.Error())
 		return
 	}
+	sess.reapCancelledQueries()
 	sess.respondAndCache(s.SequenceNumber, &wire.Response{
 		InReplyTo: s.SequenceNumber,
 		Nodes:     confirmationNodes(touched),
@@ -467,6 +476,7 @@ func (sess *Session) handleDelete(d *wire.Delete) {
 		sess.respondError(d.SequenceNumber, errInvalidDelete, err.Error())
 		return
 	}
+	sess.reapCancelledQueries()
 	sess.respondAndCache(d.SequenceNumber, &wire.Response{
 		InReplyTo: d.SequenceNumber,
 		Nodes:     confirmationNodes(deleted),
@@ -520,10 +530,19 @@ func (sess *Session) handleQuery(ctx context.Context, q *wire.Query) {
 		sess.respondError(q.SequenceNumber, errInvalidQuery, err.Error())
 		return
 	}
-	runner := query.NewRunner(*q, treeSampler{sess.server.Tree}, sessionResultSink{sess})
+
+	// Every query gets its own results subcontainer, created up front
+	// (before any push, if any) so a client can address it -- to Get it,
+	// or to Delete it and cancel the query -- from the moment registration
+	// is acknowledged. See node.asn's SESSION PATHS docs.
+	resultsNode := sess.server.Tree.AppendUnder(sess.queryResultsPath,
+		fmt.Sprintf("Query-SequenceNumber=%d", q.SequenceNumber), wire.NoValue())
+
+	runner := query.NewRunner(*q, treeSampler{sess.server.Tree}, sessionResultSink{sess: sess, resultsNode: resultsNode})
 
 	sess.queriesMu.Lock()
 	sess.activeQueries[q.SequenceNumber] = runner
+	sess.queryResultNodes[q.SequenceNumber] = resultsNode
 	sess.queriesMu.Unlock()
 
 	runner.Start(ctx)
@@ -533,13 +552,16 @@ func (sess *Session) handleQuery(ctx context.Context, q *wire.Query) {
 		// synchronously and returned -- there's no goroutine left running
 		// for this entry to track, so don't let a session that issues many
 		// ONCE queries over a long lifetime accumulate a dead entry per
-		// query forever. Interval/onChange queries stay in the map: they
-		// have a real background goroutine, and there's no per-query
-		// cancel yet (see README's Known gaps) to hook cleanup to besides
-		// session teardown, which already stops them via run()'s deferred
-		// loop over activeQueries.
+		// query forever. The results node itself stays (a client can still
+		// Get or Delete it as ordinary cleanup, just without the "also
+		// cancel a runner" side effect, since there's no runner left).
+		// Interval/onChange queries stay in both maps: they have a real
+		// background goroutine, cancellable either by deleting
+		// resultsNode or by session teardown (run()'s deferred loop over
+		// activeQueries), whichever comes first.
 		sess.queriesMu.Lock()
 		delete(sess.activeQueries, q.SequenceNumber)
+		delete(sess.queryResultNodes, q.SequenceNumber)
 		sess.queriesMu.Unlock()
 	}
 
@@ -548,6 +570,27 @@ func (sess *Session) handleQuery(ctx context.Context, q *wire.Query) {
 	// InReplyTo -- the client tells them apart by content (this one always
 	// has empty Nodes).
 	sess.respondAndCache(q.SequenceNumber, &wire.Response{InReplyTo: q.SequenceNumber})
+}
+
+// reapCancelledQueries stops (and forgets) every active query whose own
+// results node is no longer reachable from the tree root -- e.g. because a
+// Delete or Set just detached it, or detached an ancestor of it. Called
+// after any operation that could have detached a subtree (handleDelete,
+// handleSet); cheap and a no-op when nothing relevant happened, since it
+// only touches this session's own queryResultNodes.
+func (sess *Session) reapCancelledQueries() {
+	sess.queriesMu.Lock()
+	defer sess.queriesMu.Unlock()
+	for seq, node := range sess.queryResultNodes {
+		if sess.server.Tree.IsReachable(node) {
+			continue
+		}
+		if r, ok := sess.activeQueries[seq]; ok {
+			r.Stop()
+			delete(sess.activeQueries, seq)
+		}
+		delete(sess.queryResultNodes, seq)
+	}
 }
 
 type treeSampler struct{ tree *tree.Tree }
@@ -570,13 +613,21 @@ func (s treeSampler) ChangedSince(since uint64) (<-chan struct{}, uint64) {
 	return s.tree.ChangedSince(since)
 }
 
-type sessionResultSink struct{ sess *Session }
+// sessionResultSink delivers one query's results under its own
+// resultsNode (see handleQuery), not the session's shared QueryResults
+// directly -- that per-query scoping is what lets Delete target one
+// query's results (and thereby cancel it) without disturbing any other
+// active query in the same session.
+type sessionResultSink struct {
+	sess        *Session
+	resultsNode *tree.Node
+}
 
 func (s sessionResultSink) DeliverResults(querySeq int64, results map[string][]wire.NodeValue) error {
 	var nodes []wire.Node
 	for key, values := range results {
 		for _, v := range values {
-			n := s.sess.server.Tree.AppendUnder(s.sess.queryResultsPath, key, v)
+			n := s.sess.server.Tree.AppendUnder(s.resultsNode, key, v)
 			nodes = append(nodes, wire.Node{
 				Key: n.Key, Value: n.Value,
 				FirstChild: wire.OffsetPointer(0), NextSibling: wire.OffsetPointer(0),

@@ -31,10 +31,10 @@ Noise-based crypto).
 | Package | Purpose |
 |---|---|
 | `internal/wire` | Hand-written BER codec for every node.asn message type, verified against real `asn1tools`-encoded fixtures (`testdata_fixtures.json`) -- not `encoding/asn1` struct tags, which don't cleanly express this schema's mix of IMPLICIT/EXPLICIT-on-CHOICE tagging (see the package doc comment for why) |
-| `internal/tree` | The in-memory Node tree, match-expression parser/evaluator, flattening (a port of the design proven out in the (now-removed) Python prototype's `common.py`), `Set`'s atomic multi-edit application (with rollback on a conflicting structural edit, including reparenting via `newParent`), `Delete`'s own relink-around-the-gap logic, `CreateStaged`'s nested-subtree-in-staging-space support, and a change-notification primitive (`ChangedSince`) `Query`'s `onChange` mode blocks on |
+| `internal/tree` | The in-memory Node tree, match-expression parser/evaluator, flattening (a port of the design proven out in the (now-removed) Python prototype's `common.py`), `Set`'s atomic multi-edit application (with rollback on a conflicting structural edit, including reparenting via `newParent`), `Delete`'s own relink-around-the-gap logic, `CreateStaged`'s nested-subtree-in-staging-space support, a change-notification primitive (`ChangedSince`) `Query`'s `onChange` mode blocks on, and `IsReachable` (is a node still attached to Root, used for delete-cancels-query) |
 | `internal/reliability` | `SummaryAck`-based ack/retransmit over QUIC datagrams |
 | `internal/query` | `Query`'s collect/aggregate/transfer pipeline (interval-polled or event-driven `onChange`) and aggregation math (min/max/mean/stdDev/percentile) |
-| `internal/server` | Session management (one per QUIC connection), message dispatch, error-node generation |
+| `internal/server` | Session management (one per QUIC connection), message dispatch, error-node generation, per-query cancellation (deleting a query's own results node stops it) |
 | `internal/certs` | Throwaway self-signed TLS cert for the demo (QUIC mandates TLS 1.3) -- not a real mTLS story, see below |
 | `cmd/server`, `cmd/client` | CLI binaries -- `cmd/server` also embeds and seeds a real IF-MIB dataset, see below |
 
@@ -94,6 +94,14 @@ go run ./cmd/client query --collection 1 --agg-interval 3 --agg-method mean --tr
 # value. In another terminal while this is running, try:
 #   go run ./cmd/client set --value 99 "/config/timeout"
 go run ./cmd/client query --on-change --transfer 1 --watch 15s "/config/timeout"
+
+# Per-query cancellation: no dedicated message -- every Query gets its own
+# results subcontainer under QueryResults (see SESSION PATHS in node.asn),
+# and deleting THAT node stops the query, the same as if the session had
+# disconnected. Like the staging/commit demo above, this needs one
+# connection (find your session, register a query, delete that query's
+# own results node, all within it) -- not copy-pasteable across separate
+# `go run` invocations.
 ```
 
 Note: flags must come *before* the positional expression (Go's `flag`
@@ -246,11 +254,6 @@ I/O.
   updating -- there's no tombstone/removal concept in `QueryResults`,
   only additions. Closing this needs a deletion marker in the wire
   schema, not just server logic.
-- **No per-subscription cancel.** A session can have several concurrent
-  `Query`s running (`Session.activeQueries`), but there's no message to
-  stop just one -- the only way to stop any of them today is to close the
-  whole connection. Relevant to `onChange` in particular, since it's
-  meant for long-lived subscriptions.
 
 ## Testing
 
