@@ -32,9 +32,9 @@ func main() {
 		fmt.Fprintf(os.Stderr, "usage: %s [-addr host:port] <command> [args...]\n\n", os.Args[0])
 		fmt.Fprintf(os.Stderr, "commands:\n")
 		fmt.Fprintf(os.Stderr, "  get <expression>\n")
-		fmt.Fprintf(os.Stderr, "  set [--value V] [--first-child EXPR|none] [--next-sibling EXPR|none] <expression> [expression...]\n")
+		fmt.Fprintf(os.Stderr, "  set [--value V] [--first-child EXPR|none] [--next-sibling EXPR|none] [--new-parent EXPR] <expression> [expression...]\n")
 		fmt.Fprintf(os.Stderr, "  delete <expression> [expression...]\n")
-		fmt.Fprintf(os.Stderr, "  create <key> [value]\n")
+		fmt.Fprintf(os.Stderr, "  create [--parent EXPR] <key> [value]\n")
 		fmt.Fprintf(os.Stderr, "  query <expression> [--collection SECONDS | --on-change] --transfer SECONDS [--agg-interval SECONDS --agg-method min|max|mean|stddev|pNN]\n")
 	}
 	flag.Parse()
@@ -326,9 +326,10 @@ func runSet(ctx context.Context, c *client, args []string) {
 	value := fs.String("value", "", "new string value, applied to every node each expression matches")
 	firstChild := fs.String("first-child", "", "new firstChild: an expression, or 'none' (each expression must match exactly 1 node)")
 	nextSibling := fs.String("next-sibling", "", "new nextSibling: an expression, or 'none' (each expression must match exactly 1 node)")
+	newParent := fs.String("new-parent", "", "reparent each expression's (staged) node to become the last child of this expression's node -- commits a subtree staged via 'create' into live config")
 	fs.Parse(args)
 	if fs.NArg() < 1 {
-		fmt.Fprintln(os.Stderr, "usage: set [--value V] [--first-child EXPR|none] [--next-sibling EXPR|none] <expression> [expression...]")
+		fmt.Fprintln(os.Stderr, "usage: set [--value V] [--first-child EXPR|none] [--next-sibling EXPR|none] [--new-parent EXPR] <expression> [expression...]")
 		os.Exit(2)
 	}
 
@@ -344,6 +345,9 @@ func runSet(ctx context.Context, c *client, args []string) {
 		}
 		if *nextSibling != "" {
 			edit.NewNextSibling = parsePointerFlag(*nextSibling)
+		}
+		if *newParent != "" {
+			edit.NewParent = newParent
 		}
 		s.Edits = append(s.Edits, edit)
 	}
@@ -387,16 +391,28 @@ func parsePointerFlag(s string) *wire.NodePointer {
 	return &p
 }
 
+// runCreate creates one node. By default it's appended directly under this
+// session's own staged NewNodes; --parent, if given, must be an expression
+// resolving to NewNodes itself or one of its own descendants (an earlier
+// Create's own result, letting a subtree be built up staged-node by
+// staged-node -- see node.asn's Create docs) rather than anywhere in live
+// config.
 func runCreate(ctx context.Context, c *client, args []string) {
-	if len(args) < 1 || len(args) > 2 {
-		fmt.Fprintln(os.Stderr, "usage: create <key> [value]")
+	fs := flag.NewFlagSet("create", flag.ExitOnError)
+	parent := fs.String("parent", "", "an expression naming an existing staged node (this session's own NewNodes, or one of its descendants) to create under instead of NewNodes itself")
+	fs.Parse(args)
+	if fs.NArg() < 1 || fs.NArg() > 2 {
+		fmt.Fprintln(os.Stderr, "usage: create [--parent EXPR] <key> [value]")
 		os.Exit(2)
 	}
 	seq := c.allocSeq()
-	create := &wire.Create{SequenceNumber: seq, Key: args[0]}
-	if len(args) == 2 {
-		v := wire.StringValue(args[1])
+	create := &wire.Create{SequenceNumber: seq, Key: fs.Arg(0)}
+	if fs.NArg() == 2 {
+		v := wire.StringValue(fs.Arg(1))
 		create.Value = &v
+	}
+	if *parent != "" {
+		create.Parent = parent
 	}
 	resp, err := c.sendAndWait(ctx, seq, wire.Message{Kind: wire.MsgCreate, Create: create})
 	if err != nil {

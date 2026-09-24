@@ -144,6 +144,7 @@ type SetEdit struct {
 	NewValue       *NodeValue   // nil = omitted (OPTIONAL, "leave unchanged")
 	NewFirstChild  *NodePointer // nil = omitted; a present NonePointer() explicitly clears it
 	NewNextSibling *NodePointer
+	NewParent      *string // nil = omitted; reparents Target under this expression's resolved node (see node.asn's SetEdit docs)
 }
 
 type Set struct {
@@ -160,6 +161,7 @@ type Create struct {
 	SequenceNumber int64
 	Key            string
 	Value          *NodeValue // nil = omitted -> server creates a NoValue() container node
+	Parent         *string    // nil = omitted -> directly under this session's own NewNodes
 }
 
 type AggregationKind int

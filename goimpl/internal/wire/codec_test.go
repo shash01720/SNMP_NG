@@ -115,6 +115,15 @@ func TestSetFixture(t *testing.T) {
 		},
 	}
 	checkFixture(t, fixtures, "Set_multi", MarshalSet(multi), UnmarshalSet, multi)
+
+	newParent := "/config/interfaces"
+	commit := &Set{
+		SequenceNumber: 14,
+		Edits: []SetEdit{
+			{Target: "/Sessions/Connection-ID\\=abc/NewNodes/interface", NewParent: &newParent},
+		},
+	}
+	checkFixture(t, fixtures, "Set_newParent", MarshalSet(commit), UnmarshalSet, commit)
 }
 
 func TestDeleteFixture(t *testing.T) {
@@ -131,6 +140,11 @@ func TestCreateFixtures(t *testing.T) {
 
 	c2 := &Create{SequenceNumber: 4, Key: "container"}
 	checkFixture(t, fixtures, "Create_2", MarshalCreate(c2), UnmarshalCreate, c2)
+
+	v3 := StringValue("eth9")
+	parent := "/Sessions/Connection-ID\\=abc/NewNodes/interface"
+	c3 := &Create{SequenceNumber: 13, Key: "ifDescr", Value: &v3, Parent: &parent}
+	checkFixture(t, fixtures, "Create_staged", MarshalCreate(c3), UnmarshalCreate, c3)
 }
 
 func TestQueryFixtures(t *testing.T) {

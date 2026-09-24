@@ -66,9 +66,30 @@ cases = {
             ],
         },
     ),
+    "Set_newParent": (
+        "Set",
+        {
+            "sequenceNumber": 14,
+            "edits": [
+                {
+                    "target": "/Sessions/Connection-ID\\=abc/NewNodes/interface",
+                    "newParent": "/config/interfaces",
+                }
+            ],
+        },
+    ),
     "Delete_1": ("Delete", {"sequenceNumber": 11, "targets": ["/users/user=alice", "/config/retries"]}),
     "Create_1": ("Create", {"sequenceNumber": 3, "key": "note", "value": ("octetString", b"hi")}),
     "Create_2": ("Create", {"sequenceNumber": 4, "key": "container"}),
+    "Create_staged": (
+        "Create",
+        {
+            "sequenceNumber": 13,
+            "key": "ifDescr",
+            "value": ("octetString", b"eth9"),
+            "parent": "/Sessions/Connection-ID\\=abc/NewNodes/interface",
+        },
+    ),
     "AggregationMethod_percentile": ("AggregationMethod", ("percentile", 95)),
     "AggregationMethod_mean": ("AggregationMethod", ("mean", None)),
     "Query_1": (

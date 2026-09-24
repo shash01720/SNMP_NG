@@ -390,6 +390,9 @@ func encodeSetEditFields(buf *bytes.Buffer, e SetEdit) {
 	if e.NewNextSibling != nil {
 		writeExplicitPointer(buf, 3, *e.NewNextSibling)
 	}
+	if e.NewParent != nil {
+		encodeString(buf, classContext, false, 4, *e.NewParent)
+	}
 }
 
 // encodeSetEditWrapped writes one SetEdit as it appears inside a SEQUENCE
@@ -436,6 +439,9 @@ func decodeSetEditFields(content []byte) (SetEdit, error) {
 				return SetEdit{}, fmt.Errorf("wire: SetEdit.newNextSibling: %w", err)
 			}
 			e.NewNextSibling = &p
+		case 4:
+			s := string(t.content)
+			e.NewParent = &s
 		default:
 			return SetEdit{}, fmt.Errorf("wire: SetEdit: unexpected field tag %d", t.tag)
 		}
@@ -561,6 +567,9 @@ func encodeCreateFields(buf *bytes.Buffer, c *Create) {
 	if c.Value != nil {
 		writeExplicitValue(buf, 2, *c.Value)
 	}
+	if c.Parent != nil {
+		encodeString(buf, classContext, false, 3, *c.Parent)
+	}
 }
 
 func MarshalCreate(c *Create) []byte { return wrapSequence(encodeCreateFields, c) }
@@ -579,22 +588,24 @@ func decodeCreateFields(content []byte) (*Create, error) {
 		return nil, fmt.Errorf("wire: Create.key: %w", err)
 	}
 	c.Key = string(t.content)
-	if len(rest) > 0 {
+	for len(rest) > 0 {
 		t, rest, err = readTLV(rest)
 		if err != nil {
-			return nil, fmt.Errorf("wire: Create.value: %w", err)
+			return nil, fmt.Errorf("wire: Create: %w", err)
 		}
-		if t.tag != 2 {
+		switch t.tag {
+		case 2:
+			v, err := decodeNodeValue(t.content)
+			if err != nil {
+				return nil, fmt.Errorf("wire: Create.value: %w", err)
+			}
+			c.Value = &v
+		case 3:
+			s := string(t.content)
+			c.Parent = &s
+		default:
 			return nil, fmt.Errorf("wire: Create: unexpected field tag %d", t.tag)
 		}
-		v, err := decodeNodeValue(t.content)
-		if err != nil {
-			return nil, fmt.Errorf("wire: Create.value: %w", err)
-		}
-		c.Value = &v
-	}
-	if len(rest) != 0 {
-		return nil, fmt.Errorf("wire: %d trailing byte(s) after Create", len(rest))
 	}
 	return c, nil
 }

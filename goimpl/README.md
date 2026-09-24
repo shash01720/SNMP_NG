@@ -31,7 +31,7 @@ Noise-based crypto).
 | Package | Purpose |
 |---|---|
 | `internal/wire` | Hand-written BER codec for every node.asn message type, verified against real `asn1tools`-encoded fixtures (`testdata_fixtures.json`) -- not `encoding/asn1` struct tags, which don't cleanly express this schema's mix of IMPLICIT/EXPLICIT-on-CHOICE tagging (see the package doc comment for why) |
-| `internal/tree` | The in-memory Node tree, match-expression parser/evaluator, flattening (a port of the design proven out in the (now-removed) Python prototype's `common.py`), `Set`'s atomic multi-edit application (with rollback on a conflicting structural edit), `Delete`'s own relink-around-the-gap logic, and a change-notification primitive (`ChangedSince`) `Query`'s `onChange` mode blocks on |
+| `internal/tree` | The in-memory Node tree, match-expression parser/evaluator, flattening (a port of the design proven out in the (now-removed) Python prototype's `common.py`), `Set`'s atomic multi-edit application (with rollback on a conflicting structural edit, including reparenting via `newParent`), `Delete`'s own relink-around-the-gap logic, `CreateStaged`'s nested-subtree-in-staging-space support, and a change-notification primitive (`ChangedSince`) `Query`'s `onChange` mode blocks on |
 | `internal/reliability` | `SummaryAck`-based ack/retransmit over QUIC datagrams |
 | `internal/query` | `Query`'s collect/aggregate/transfer pipeline (interval-polled or event-driven `onChange`) and aggregation math (min/max/mean/stdDev/percentile) |
 | `internal/server` | Session management (one per QUIC connection), message dispatch, error-node generation |
@@ -64,6 +64,23 @@ go run ./cmd/client set --value 60 "/config/timeout" "/config/retries"
 # client only needs to address the node it wants gone -- no more manual
 # "set --next-sibling none" dance. Also regex-based and multi-target.
 go run ./cmd/client delete "/config/retries"
+
+# Staging + commit (NETCONF candidate/commit, for NEW subtrees): Create's
+# default target is this session's own private staging area under
+# NewNodes -- invisible from live config until explicitly attached.
+# Because each `go run ./cmd/client ...` invocation opens its own fresh
+# connection/session, actually seeing this requires staying on ONE
+# connection (unlike the copy-pasteable examples above); find your own
+# session first --
+go run ./cmd/client get "/Sessions"
+# -- then, reusing that connection: `create interface` (lands under
+# NewNodes), `create --parent .../NewNodes/interface ifDescr eth9`
+# (nests a child under the still-staged node -- an arbitrarily deep
+# subtree can be built this way, one Create at a time), then commit the
+# whole thing atomically with `set --new-parent /config
+# .../NewNodes/interface`. /config/interface then exists with its
+# ifDescr child attached, and NewNodes is empty again: the subtree
+# moved, not copied.
 
 # a query that runs once and returns immediately
 go run ./cmd/client query --collection 0 --transfer 0 "/config/timeout"
@@ -179,6 +196,14 @@ I/O.
 
 ## Known gaps (honestly, not swept under the rug)
 
+- **`Create`'s staging + `Set`'s `newParent` only cover PART of NETCONF's
+  candidate/commit model.** They give a client an atomic way to introduce
+  a whole NEW subtree (build it under NewNodes across several Create
+  calls, attach it with one Set) -- but an ordinary Set targeting an
+  EXISTING live node still applies immediately, not staged until some
+  later commit, so there's no way to stage a batch of edits to values
+  already in the tree. There's also no explicit discard: an unattached
+  staged subtree just sits under NewNodes until the session ends.
 - **No real mTLS.** `internal/certs` generates a throwaway self-signed
   certificate, and the client sets `InsecureSkipVerify`. See the parent
   conversation's mTLS design discussion (TCP+TLS vs. DTLS vs. QUIC's own

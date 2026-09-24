@@ -83,7 +83,7 @@ func TestSetUpdateValue(t *testing.T) {
 	newValue := wire.StringValue("superadmin")
 	touched, err := tr.Set(&wire.Set{Edits: []wire.SetEdit{
 		{Target: "/users/group=admin", NewValue: &newValue},
-	}})
+	}}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -104,7 +104,7 @@ func TestSetUpdateValueMultiMatch(t *testing.T) {
 	newValue := wire.StringValue("member")
 	touched, err := tr.Set(&wire.Set{Edits: []wire.SetEdit{
 		{Target: "/users/group=user", NewValue: &newValue}, // matches bob's and carol's group nodes
-	}})
+	}}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -126,7 +126,7 @@ func TestSetMultipleEdits(t *testing.T) {
 	touched, err := tr.Set(&wire.Set{Edits: []wire.SetEdit{
 		{Target: "/users/group=admin", NewValue: &aliceGroup},
 		{Target: "/config/timeout", NewValue: &timeout},
-	}})
+	}}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -151,7 +151,7 @@ func TestSetZeroMatchIsNotAnError(t *testing.T) {
 	v := wire.StringValue("x")
 	touched, err := tr.Set(&wire.Set{Edits: []wire.SetEdit{
 		{Target: "/nonexistent", NewValue: &v},
-	}})
+	}}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -169,7 +169,7 @@ func TestSetStructuralEditRequiresExactlyOneMatch(t *testing.T) {
 
 	_, err := tr.Set(&wire.Set{Edits: []wire.SetEdit{
 		{Target: "/users/user", NewNextSibling: ptrNodePointer(wire.NonePointer())}, // matches 3 nodes (alice/bob/carol)
-	}})
+	}}, nil)
 	if err == nil {
 		t.Fatal("expected an error for a structural edit matching 3 nodes")
 	}
@@ -206,12 +206,140 @@ func TestSetAtomicRollbackOnConflict(t *testing.T) {
 		// APPLIED, edit 1 has already removed retries from config's
 		// Children.
 		{Target: "/config/retries", NewNextSibling: ptrNodePointer(wire.NonePointer())},
-	}})
+	}}, nil)
 	if err == nil {
 		t.Fatal("expected an error from the conflicting second edit")
 	}
 	if len(config.Children) != 2 || config.Children[0].Key != "timeout" || config.Children[1].Key != "retries" {
 		t.Fatalf("edit 1 wasn't rolled back after edit 2 failed: config children = %+v", config.Children)
+	}
+}
+
+// --- CreateStaged / Set's newParent (staging + commit) ----------------------
+
+// TestCreateStagedNested checks that CreateStaged can build a multi-level
+// subtree under stagingRoot by repeatedly naming an already-created node as
+// the next call's parent, per node.asn's Create docs.
+func TestCreateStagedNested(t *testing.T) {
+	tr := demoTree()
+	stagingRoot := &Node{Key: "NewNodes"}
+	AppendChild(tr.Root, stagingRoot)
+
+	iface, err := tr.CreateStaged(stagingRoot, "", "interface", wire.NoValue())
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = tr.CreateStaged(stagingRoot, "/NewNodes/interface", "ifDescr", wire.StringValue("eth9"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(iface.Children) != 1 || iface.Children[0].Key != "ifDescr" {
+		t.Fatalf("iface children = %+v, want [ifDescr]", iface.Children)
+	}
+}
+
+// TestCreateStagedRejectsOutsideStaging checks CreateStaged's confinement:
+// a parent expression resolving to a node outside stagingRoot's own subtree
+// is rejected, not silently allowed to graft into live config.
+func TestCreateStagedRejectsOutsideStaging(t *testing.T) {
+	tr := demoTree()
+	stagingRoot := &Node{Key: "NewNodes"}
+	AppendChild(tr.Root, stagingRoot)
+
+	_, err := tr.CreateStaged(stagingRoot, "/config", "sneaky", wire.NoValue())
+	if err == nil {
+		t.Fatal("expected an error for a parent outside the staging subtree")
+	}
+	config, _ := tr.FindOne("/config")
+	for _, c := range config.Children {
+		if c.Key == "sneaky" {
+			t.Fatal("the node was created under /config despite the rejected parent")
+		}
+	}
+}
+
+// TestSetNewParentCommitsStagedSubtree is the scenario this feature exists
+// for: build a subtree under a session's own staged NewNodes across several
+// Create calls, then attach its root into live config with one Set carrying
+// newParent -- addressing NETCONF's candidate/commit gap for new subtrees
+// (see SetEdit's node.asn docs).
+func TestSetNewParentCommitsStagedSubtree(t *testing.T) {
+	tr := demoTree()
+	stagingRoot := &Node{Key: "NewNodes"}
+	AppendChild(tr.Root, stagingRoot)
+
+	iface, err := tr.CreateStaged(stagingRoot, "", "interface", wire.NoValue())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tr.CreateStaged(stagingRoot, "/NewNodes/interface", "ifDescr", wire.StringValue("eth9")); err != nil {
+		t.Fatal(err)
+	}
+
+	// Not reachable from live config yet.
+	if nodes, _ := tr.Get("/config/interface"); len(nodes) != 0 {
+		t.Fatalf("staged subtree should not be reachable from /config yet: %+v", nodes)
+	}
+
+	newParent := "/config"
+	touched, err := tr.Set(&wire.Set{Edits: []wire.SetEdit{
+		{Target: "/NewNodes/interface", NewParent: &newParent},
+	}}, stagingRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(touched) != 1 || touched[0] != iface {
+		t.Fatalf("touched = %+v, want [iface]", touched)
+	}
+
+	// Now reachable from live config, whole subtree intact...
+	nodes, err := tr.Get("/config/interface")
+	if err != nil || len(nodes) != 2 { // interface + its ifDescr child
+		t.Fatalf("got %+v, err=%v, want the interface and its child under /config", nodes, err)
+	}
+	// ...and gone from staging.
+	if len(stagingRoot.Children) != 0 {
+		t.Fatalf("staging root still has children after commit: %+v", stagingRoot.Children)
+	}
+}
+
+// TestSetNewParentRejectsNonStagedTarget checks the "target must currently
+// be staged" rule: a client can't reparent an arbitrary live config node
+// via newParent, only something it created and hasn't committed yet.
+func TestSetNewParentRejectsNonStagedTarget(t *testing.T) {
+	tr := demoTree()
+	stagingRoot := &Node{Key: "NewNodes"}
+	AppendChild(tr.Root, stagingRoot)
+
+	newParent := "/config"
+	_, err := tr.Set(&wire.Set{Edits: []wire.SetEdit{
+		{Target: "/users/user=alice", NewParent: &newParent},
+	}}, stagingRoot)
+	if err == nil {
+		t.Fatal("expected an error: alice's node isn't part of this session's staged nodes")
+	}
+}
+
+// TestSetNewParentRejectsCycle checks that attaching a staged subtree under
+// one of its own descendants is rejected rather than corrupting the tree.
+func TestSetNewParentRejectsCycle(t *testing.T) {
+	tr := demoTree()
+	stagingRoot := &Node{Key: "NewNodes"}
+	AppendChild(tr.Root, stagingRoot)
+
+	if _, err := tr.CreateStaged(stagingRoot, "", "parent", wire.NoValue()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tr.CreateStaged(stagingRoot, "/NewNodes/parent", "child", wire.NoValue()); err != nil {
+		t.Fatal(err)
+	}
+
+	newParent := "/NewNodes/parent/child"
+	_, err := tr.Set(&wire.Set{Edits: []wire.SetEdit{
+		{Target: "/NewNodes/parent", NewParent: &newParent},
+	}}, stagingRoot)
+	if err == nil {
+		t.Fatal("expected a cycle error: parent can't become a child of its own child")
 	}
 }
 
@@ -272,7 +400,7 @@ func TestSetDeleteViaNextSibling(t *testing.T) {
 	_, err = tr.Set(&wire.Set{Edits: []wire.SetEdit{{
 		Target:         "/config/timeout",
 		NewNextSibling: ptrNodePointer(wire.NonePointer()),
-	}}})
+	}}}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

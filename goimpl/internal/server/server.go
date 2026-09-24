@@ -367,6 +367,7 @@ const (
 	errAmbiguousTarget   = "AmbiguousTarget"
 	errInvalidSet        = "InvalidSet"
 	errInvalidDelete     = "InvalidDelete"
+	errInvalidCreate     = "InvalidCreate"
 	errInvalidQuery      = "InvalidQuery"
 	errInternal          = "InternalError"
 )
@@ -414,7 +415,7 @@ func (sess *Session) handleGet(g *wire.Get) {
 // --- Set -------------------------------------------------------------------
 
 func (sess *Session) handleSet(s *wire.Set) {
-	touched, err := sess.server.Tree.Set(s)
+	touched, err := sess.server.Tree.Set(s, sess.newNodesPath)
 	if err != nil {
 		// Set's edits can each fail for a different reason (bad expression,
 		// wrong match count, a relink conflict between two edits), so
@@ -452,7 +453,15 @@ func (sess *Session) handleCreate(c *wire.Create) {
 	if c.Value != nil {
 		value = *c.Value
 	}
-	n := sess.server.Tree.AppendUnder(sess.newNodesPath, c.Key, value)
+	parentExpr := ""
+	if c.Parent != nil {
+		parentExpr = *c.Parent
+	}
+	n, err := sess.server.Tree.CreateStaged(sess.newNodesPath, parentExpr, c.Key, value)
+	if err != nil {
+		sess.respondError(c.SequenceNumber, errInvalidCreate, err.Error())
+		return
+	}
 	sess.respondAndCache(c.SequenceNumber, &wire.Response{
 		InReplyTo: c.SequenceNumber,
 		Nodes:     confirmationNodes([]*tree.Node{n}),

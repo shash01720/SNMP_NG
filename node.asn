@@ -106,19 +106,40 @@ Get ::= SEQUENCE {
 -- and may match zero or more nodes.
 --
 -- newValue is applied to every node `target` matches (a no-op if it
--- matches none). newFirstChild/newNextSibling are structural,
--- single-node operations: `target` MUST resolve to exactly one node
--- when either is present (an error otherwise), since relinking a
--- shared pointer across multiple nodes isn't a well-defined tree
--- operation. Each of the three fields is independently optional:
--- omitted means "leave this field unchanged". A pointer field can be
+-- matches none). newFirstChild/newNextSibling/newParent are
+-- structural, single-node operations: `target` MUST resolve to exactly
+-- one node when any of the three is present (an error otherwise),
+-- since relinking a shared pointer across multiple nodes isn't a
+-- well-defined tree operation. Each field is independently optional:
+-- omitted means "leave this alone". A NodePointer field can be
 -- explicitly cleared by supplying `none` (NodePointer's none arm).
+--
+-- newParent, if present, reparents `target` itself to become the new
+-- last child of whatever `newParent` resolves to (also exactly one
+-- node, anywhere in the tree; `none`/offset are not meaningful here,
+-- hence UTF8String rather than NodePointer). `target` must currently be
+-- one of this session's own staged nodes under NewNodes (see Create,
+-- above), an error otherwise, and newParent's resolved node must not
+-- be `target` itself or a descendant of it (that would create a
+-- cycle).
+--
+-- This is how a client commits a subtree staged via Create into live
+-- config: build it under NewNodes across as many Create calls as
+-- needed, then attach its root with one Set carrying newParent.
+-- Nothing staged under NewNodes is reachable from any other part of
+-- the tree until this makes it so, which covers NETCONF's candidate/
+-- commit gap for NEW subtrees specifically. It does NOT give staged,
+-- deferred edits to EXISTING live values (an ordinary Set targeting a
+-- live node still applies immediately, not on some later commit), nor
+-- an explicit discard/validate step; an unattached staged subtree
+-- simply sits under NewNodes until the session ends.
 
 SetEdit ::= SEQUENCE {
     target          UTF8String,
     newValue        NodeValue OPTIONAL,
     newFirstChild   NodePointer OPTIONAL,
-    newNextSibling  NodePointer OPTIONAL
+    newNextSibling  NodePointer OPTIONAL,
+    newParent       UTF8String OPTIONAL
 }
 
 -- Applies every edit in `edits`, atomically: every target is resolved
@@ -151,16 +172,22 @@ Delete ::= SEQUENCE {
     targets         SEQUENCE OF UTF8String
 }
 
--- Creates a new node under this session's own
--- "/Sessions/Connection-ID=<session-id>/NewNodes" subtree (see
--- SESSION PATHS, below), appended as that parent's last child. The
--- server responds with a Response whose `nodes` contains exactly the
--- one newly created node.
+-- Creates a new node under this session's own staged
+-- "/Sessions/Connection-ID=<session-id>/NewNodes" subtree (see SESSION
+-- PATHS, below), appended as the parent's last child. By default the
+-- parent is NewNodes itself; `parent`, if given, must resolve to
+-- exactly one node that is NewNodes or one of its own descendants (an
+-- error otherwise), letting a client build an arbitrarily deep
+-- subtree entirely in private staging space via repeated Create calls,
+-- before attaching it to live config in one step with SetEdit's
+-- newParent, below. The server responds with a Response whose `nodes`
+-- contains exactly the one newly created node.
 
 Create ::= SEQUENCE {
     sequenceNumber  INTEGER,
     key             UTF8String,
-    value           NodeValue OPTIONAL   -- omitted = noValue container node
+    value           NodeValue OPTIONAL,  -- omitted = noValue container node
+    parent          UTF8String OPTIONAL  -- omitted = directly under NewNodes
 }
 
 -- Aggregation, applicable only to numeric NodeValue kinds (everything

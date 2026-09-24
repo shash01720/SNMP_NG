@@ -469,6 +469,35 @@ func (t *Tree) AppendUnder(parent *Node, key string, value wire.NodeValue) *Node
 	return n
 }
 
+// CreateStaged implements Create's node.asn semantics: parentExpr, if
+// non-empty, must resolve to exactly one node that is stagingRoot itself
+// or one of its own descendants (an error otherwise); an empty parentExpr
+// appends directly under stagingRoot, matching the old single-parent
+// behavior. This is how a client builds an arbitrarily deep subtree
+// entirely under its own session's staged NewNodes, one Create call at a
+// time, before attaching it to live config with Set's newParent.
+func (t *Tree) CreateStaged(stagingRoot *Node, parentExpr string, key string, value wire.NodeValue) (*Node, error) {
+	t.mu.Lock()
+	parent := stagingRoot
+	if parentExpr != "" {
+		n, err := t.resolveExpressionExactlyOneLocked(parentExpr)
+		if err != nil {
+			t.mu.Unlock()
+			return nil, fmt.Errorf("parent %q: %w", parentExpr, err)
+		}
+		if !isDescendantOrSelf(stagingRoot, n) {
+			t.mu.Unlock()
+			return nil, fmt.Errorf("parent %q: not part of this session's own staged nodes", parentExpr)
+		}
+		parent = n
+	}
+	n := &Node{Key: key, Value: value}
+	AppendChild(parent, n)
+	t.mu.Unlock()
+	t.notifyChanged()
+	return n, nil
+}
+
 // setEditPlan is one edit fully resolved against the tree as it stood
 // before any edit in this Set request was applied -- see Set's doc comment
 // for why resolving everything up front, before mutating anything, is what
@@ -478,29 +507,36 @@ type setEditPlan struct {
 	targets     []*Node // newValue's target(s) (0+); structural edits' single target (exactly 1, checked during planning)
 	firstChild  *Node   // pre-resolved edit.NewFirstChild target; meaningful only if edit.NewFirstChild != nil (nil there means "clear")
 	nextSibling *Node   // pre-resolved edit.NewNextSibling target; meaningful only if edit.NewNextSibling != nil
+	newParent   *Node   // pre-resolved edit.NewParent target; meaningful only if edit.NewParent != nil
 }
 
 // Set applies every edit in s.Edits atomically. Each edit's target is a
 // match expression (like Get's, not a NodePointer) which may match zero or
 // more nodes for a value-only edit; newValue is applied to every match (a
 // no-op if there are none, the same "empty match isn't an error" idempotent
-// stance Get and Delete take). newFirstChild/newNextSibling are structural
-// operations and require target to resolve to exactly one node.
+// stance Get and Delete take). newFirstChild/newNextSibling/newParent are
+// structural operations and require target to resolve to exactly one node.
+//
+// stagingRoot is this session's own NewNodes node (see Create), needed to
+// enforce newParent's "target must currently be staged" rule; pass nil if
+// the caller has no session concept (e.g. a test operating on the tree
+// directly) and no edit in s.Edits uses newParent.
 //
 // Every edit's target -- and, for structural edits, its newFirstChild/
-// newNextSibling pointer target -- is resolved against the tree as it
-// stood when Set was called, before any edit in this request is applied,
-// so earlier edits never change what a later edit's target matches. If any
-// edit fails to resolve, no mutation happens at all. If a later edit's
-// planned relink turns out to conflict with an earlier edit's already-
-// applied one (both touching the same parent's child list -- possible only
-// between two structural edits in the same request), every mutation
-// already applied in this call is rolled back and the conflict is reported
-// as an error: the request is genuinely all-or-nothing, not best-effort.
+// newNextSibling/newParent pointer target -- is resolved against the tree
+// as it stood when Set was called, before any edit in this request is
+// applied, so earlier edits never change what a later edit's target
+// matches. If any edit fails to resolve, no mutation happens at all. If a
+// later edit's planned relink turns out to conflict with an earlier
+// edit's already-applied one (both touching the same parent's child list,
+// possible only between two structural edits in the same request), every
+// mutation already applied in this call is rolled back and the conflict
+// is reported as an error: the request is genuinely all-or-nothing, not
+// best-effort.
 //
 // Returns every node actually written to (deduplicated, first-touched
 // order) for the caller to report back to the client.
-func (t *Tree) Set(s *wire.Set) ([]*Node, error) {
+func (t *Tree) Set(s *wire.Set, stagingRoot *Node) ([]*Node, error) {
 	t.mu.Lock()
 
 	var plans []setEditPlan
@@ -511,10 +547,10 @@ func (t *Tree) Set(s *wire.Set) ([]*Node, error) {
 			return nil, fmt.Errorf("target %q: %w", edit.Target, err)
 		}
 		targets := Evaluate(t.Root, segments)
-		structural := edit.NewFirstChild != nil || edit.NewNextSibling != nil
+		structural := edit.NewFirstChild != nil || edit.NewNextSibling != nil || edit.NewParent != nil
 		if structural && len(targets) != 1 {
 			t.mu.Unlock()
-			return nil, fmt.Errorf("target %q: newFirstChild/newNextSibling require exactly 1 match, got %d", edit.Target, len(targets))
+			return nil, fmt.Errorf("target %q: newFirstChild/newNextSibling/newParent require exactly 1 match, got %d", edit.Target, len(targets))
 		}
 		plan := setEditPlan{edit: edit, targets: targets}
 		if edit.NewFirstChild != nil {
@@ -532,6 +568,22 @@ func (t *Tree) Set(s *wire.Set) ([]*Node, error) {
 				return nil, fmt.Errorf("target %q: newNextSibling: %w", edit.Target, err)
 			}
 			plan.nextSibling = n
+		}
+		if edit.NewParent != nil {
+			if stagingRoot == nil || !isDescendant(stagingRoot, targets[0]) {
+				t.mu.Unlock()
+				return nil, fmt.Errorf("target %q: newParent: target is not one of this session's own staged nodes", edit.Target)
+			}
+			newParentNode, err := t.resolveExpressionExactlyOneLocked(*edit.NewParent)
+			if err != nil {
+				t.mu.Unlock()
+				return nil, fmt.Errorf("target %q: newParent: %w", edit.Target, err)
+			}
+			if newParentNode == targets[0] || isDescendant(targets[0], newParentNode) {
+				t.mu.Unlock()
+				return nil, fmt.Errorf("target %q: newParent: would create a cycle", edit.Target)
+			}
+			plan.newParent = newParentNode
 		}
 		plans = append(plans, plan)
 	}
@@ -555,7 +607,12 @@ func applySetPlans(plans []setEditPlan) (touched []*Node, err error) {
 		node *Node
 		old  wire.NodeValue
 	}
+	type parentUndo struct {
+		node *Node
+		old  *Node
+	}
 	var valueUndos []valueUndo
+	var parentUndos []parentUndo
 	childrenUndos := map[*Node][]*Node{}
 	snapshotChildren := func(n *Node) {
 		if _, done := childrenUndos[n]; done {
@@ -568,6 +625,9 @@ func applySetPlans(plans []setEditPlan) (touched []*Node, err error) {
 	rollback := func() {
 		for _, u := range valueUndos {
 			u.node.Value = u.old
+		}
+		for _, u := range parentUndos {
+			u.node.Parent = u.old
 		}
 		for n, old := range childrenUndos {
 			n.Children = old
@@ -608,6 +668,26 @@ func applySetPlans(plans []setEditPlan) (touched []*Node, err error) {
 				rollback()
 				return nil, fmt.Errorf("target %q: newNextSibling: %w", p.edit.Target, err)
 			}
+			addTouched(target)
+		}
+		if p.edit.NewParent != nil {
+			target := p.targets[0]
+			newParent := p.newParent
+			oldParent := target.Parent
+			if oldParent != nil {
+				snapshotChildren(oldParent)
+				if indexOfChild(oldParent, target) < 0 {
+					rollback()
+					return nil, fmt.Errorf("target %q: newParent: node is no longer where it was resolved (removed by an earlier edit in this request)", p.edit.Target)
+				}
+			}
+			snapshotChildren(newParent)
+			if oldParent != nil {
+				removeChild(oldParent, target)
+			}
+			parentUndos = append(parentUndos, parentUndo{node: target, old: oldParent})
+			target.Parent = newParent
+			newParent.Children = append(newParent.Children, target)
 			addTouched(target)
 		}
 	}
@@ -670,11 +750,30 @@ func (t *Tree) resolveOneLocked(p wire.NodePointer) (*Node, error) {
 	if p.Kind != wire.PointerAbsolute {
 		return nil, fmt.Errorf("must be an absolute expression, not an offset")
 	}
-	segments, err := ParseExpression(p.Absolute)
+	return t.resolveExpressionExactlyOneLocked(p.Absolute)
+}
+
+func (t *Tree) resolveExpressionExactlyOneLocked(expr string) (*Node, error) {
+	segments, err := ParseExpression(expr)
 	if err != nil {
 		return nil, err
 	}
 	return EvaluateExactlyOne(t.Root, segments)
+}
+
+// isDescendant reports whether node is a strict descendant of root (root
+// itself doesn't count -- see isDescendantOrSelf for that).
+func isDescendant(root, node *Node) bool {
+	for n := node.Parent; n != nil; n = n.Parent {
+		if n == root {
+			return true
+		}
+	}
+	return false
+}
+
+func isDescendantOrSelf(root, node *Node) bool {
+	return root == node || isDescendant(root, node)
 }
 
 // resolvePointerAsChildLocked resolves a NewFirstChild/NewNextSibling value:
