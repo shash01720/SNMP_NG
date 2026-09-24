@@ -123,7 +123,7 @@ func TestQueryFixtures(t *testing.T) {
 	q1 := &Query{
 		SequenceNumber:      5,
 		NodeExpression:      "/config/timeout",
-		CollectionInterval:  300,
+		CollectionMode:      IntervalMode(300),
 		AggregationInterval: &aggInterval,
 		AggregationMethod:   &agg,
 		TransferInterval:    6000,
@@ -131,12 +131,20 @@ func TestQueryFixtures(t *testing.T) {
 	checkFixture(t, fixtures, "Query_1", MarshalQuery(q1), UnmarshalQuery, q1)
 
 	q2 := &Query{
-		SequenceNumber:     6,
-		NodeExpression:     "/config/timeout",
-		CollectionInterval: 0,
-		TransferInterval:   0,
+		SequenceNumber:   6,
+		NodeExpression:   "/config/timeout",
+		CollectionMode:   OnceMode(),
+		TransferInterval: 0,
 	}
 	checkFixture(t, fixtures, "Query_once", MarshalQuery(q2), UnmarshalQuery, q2)
+
+	q3 := &Query{
+		SequenceNumber:   9,
+		NodeExpression:   "/interfaces/ifOperStatus",
+		CollectionMode:   OnChangeMode(),
+		TransferInterval: 5,
+	}
+	checkFixture(t, fixtures, "Query_onChange", MarshalQuery(q3), UnmarshalQuery, q3)
 }
 
 func TestResponseFixtures(t *testing.T) {

@@ -31,9 +31,9 @@ Noise-based crypto).
 | Package | Purpose |
 |---|---|
 | `internal/wire` | Hand-written BER codec for every node.asn message type, verified against real `asn1tools`-encoded fixtures (`testdata_fixtures.json`) -- not `encoding/asn1` struct tags, which don't cleanly express this schema's mix of IMPLICIT/EXPLICIT-on-CHOICE tagging (see the package doc comment for why) |
-| `internal/tree` | The in-memory Node tree, match-expression parser/evaluator, flattening, and `Set`'s delete-by-relink semantics -- a port of the design proven out in the (now-removed) Python prototype's `common.py` |
+| `internal/tree` | The in-memory Node tree, match-expression parser/evaluator, flattening, `Set`'s delete-by-relink semantics (a port of the design proven out in the (now-removed) Python prototype's `common.py`), and a change-notification primitive (`ChangedSince`) `Query`'s `onChange` mode blocks on |
 | `internal/reliability` | `SummaryAck`-based ack/retransmit over QUIC datagrams |
-| `internal/query` | `Query`'s collect/aggregate/transfer pipeline and aggregation math (min/max/mean/stdDev/percentile) |
+| `internal/query` | `Query`'s collect/aggregate/transfer pipeline (interval-polled or event-driven `onChange`) and aggregation math (min/max/mean/stdDev/percentile) |
 | `internal/server` | Session management (one per QUIC connection), message dispatch, error-node generation |
 | `internal/certs` | Throwaway self-signed TLS cert for the demo (QUIC mandates TLS 1.3) -- not a real mTLS story, see below |
 | `cmd/server`, `cmd/client` | CLI binaries -- `cmd/server` also embeds and seeds a real IF-MIB dataset, see below |
@@ -61,6 +61,12 @@ go run ./cmd/client query --collection 0 --transfer 0 "/config/timeout"
 # a recurring query: sample every 1s, aggregate (mean) every 3s,
 # push accumulated results every 4s, watch for 9s
 go run ./cmd/client query --collection 1 --agg-interval 3 --agg-method mean --transfer 4 --watch 9s "/config/timeout"
+
+# an onChange query: no polling interval -- pushes an immediate baseline,
+# then a fresh push only when a Set/Create actually changes a matched
+# value. In another terminal while this is running, try:
+#   go run ./cmd/client set --value 99 "/config/timeout"
+go run ./cmd/client query --on-change --transfer 1 --watch 15s "/config/timeout"
 ```
 
 Note: flags must come *before* the positional expression (Go's `flag`
@@ -184,6 +190,16 @@ I/O.
   hook, and the CID isn't stable across a connection's lifetime anyway
   (it rotates on path migration), so a server-generated id fills the same
   role more robustly.
+- **`onChange` doesn't report deletions.** If a matched node stops
+  existing (e.g. deleted via `Set`'s relink-around convention), its last
+  known value simply stops updating -- there's no tombstone/removal
+  concept in `QueryResults`, only additions. Closing this needs a
+  deletion marker in the wire schema, not just server logic.
+- **No per-subscription cancel.** A session can have several concurrent
+  `Query`s running (`Session.activeQueries`), but there's no message to
+  stop just one -- the only way to stop any of them today is to close the
+  whole connection. Relevant to `onChange` in particular, since it's
+  meant for long-lived subscriptions.
 
 ## Testing
 

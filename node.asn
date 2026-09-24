@@ -146,32 +146,55 @@ AggregationMethod ::= CHOICE {
     percentile  [4] INTEGER (0..100)
 }
 
+-- How Query decides when to (re-)sample nodeExpression:
+--
+--   once      perform exactly one collection pass immediately, ignoring
+--             aggregationInterval/transferInterval's recurring cadence
+--             (a single sample is aggregated, if requested, as one
+--             degenerate window, and the result is transferred once).
+--   interval  re-evaluate nodeExpression every `interval` seconds
+--             (must be > 0) and sample matching nodes' values, whether
+--             or not they changed; suitable for a regular telemetry
+--             cadence (gNMI's Subscribe STREAM+SAMPLE mode).
+--   onChange  re-evaluate nodeExpression whenever the server's tree is
+--             mutated (Set/Create), but only forward a sample when a
+--             matched node's value actually differs from the last one
+--             reported for that key (or the key is newly matched);
+--             no polling interval, event-triggered (gNMI's Subscribe
+--             STREAM+ON_CHANGE mode). The first evaluation after the
+--             Query starts always reports every currently-matched
+--             value, establishing a baseline the way ON_CHANGE
+--             subscriptions conventionally do. A key that stops
+--             matching (e.g. its node is deleted) is not reported as a
+--             removal: there is currently no delete/tombstone concept
+--             in QueryResults, only additions.
+
+CollectionMode ::= CHOICE {
+    once      [0] NULL,
+    interval  [1] INTEGER,
+    onChange  [2] NULL
+}
+
 -- A recurring (or one-shot) collection query against `nodeExpression`.
 --
---   collectionInterval  how often (seconds) to internally re-evaluate
---                        nodeExpression and sample matching nodes'
---                        values. 0 means ONCE: perform exactly one
---                        collection pass immediately (ignoring
---                        aggregationInterval/transferInterval's
---                        recurring cadence; a single sample is
---                        aggregated, if requested, as one degenerate
---                        window, and the result is transferred once).
---   aggregationInterval  how often (seconds) to reduce the samples
---                        collected so far via aggregationMethod.
---                        Omitted: no aggregation, raw samples are what
---                        gets transferred.
---   aggregationMethod    required iff aggregationInterval is present.
---   transferInterval     how often (seconds) accumulated results (raw
---                        samples, or aggregation outputs) are
---                        materialized as nodes under this session's own
---                        "/Sessions/Connection-ID=<session-id>/QueryResults"
---                        subtree and pushed to the client as a
---                        Response (see SESSION PATHS, below).
+--   collectionMode        see CollectionMode, above.
+--   aggregationInterval   how often (seconds) to reduce the samples
+--                         collected so far via aggregationMethod.
+--                         Omitted: no aggregation, raw samples are what
+--                         gets transferred.
+--   aggregationMethod     required iff aggregationInterval is present.
+--   transferInterval      how often (seconds) accumulated results (raw
+--                         samples, or aggregation outputs) are
+--                         materialized as nodes under this session's own
+--                         "/Sessions/Connection-ID=<session-id>/QueryResults"
+--                         subtree and pushed to the client as a
+--                         Response (see SESSION PATHS, below). Required
+--                         (> 0) unless collectionMode is `once`.
 
 Query ::= SEQUENCE {
     sequenceNumber       INTEGER,
     nodeExpression       UTF8String,
-    collectionInterval   INTEGER,
+    collectionMode       CollectionMode,
     aggregationInterval  INTEGER OPTIONAL,
     aggregationMethod    AggregationMethod OPTIONAL,
     transferInterval     INTEGER

@@ -1,5 +1,7 @@
 package wire
 
+import "bytes"
+
 // These Go types mirror node.asn exactly. A CHOICE becomes a Go struct with
 // a Kind discriminator plus one field per alternative (only the field named
 // by Kind is meaningful) -- Go has no native discriminated union, and this
@@ -78,6 +80,36 @@ func (v NodeValue) AsFloat64() float64 {
 	}
 }
 
+// Equal reports whether v and o carry the same Kind and the same
+// represented value. Used by Query's onChange collection mode to decide
+// whether a freshly sampled value is actually new versus a repeat of what
+// was already reported for that key.
+func (v NodeValue) Equal(o NodeValue) bool {
+	if v.Kind != o.Kind {
+		return false
+	}
+	switch v.Kind {
+	case ValueInteger32:
+		return v.Integer32 == o.Integer32
+	case ValueUnsigned32:
+		return v.Unsigned32 == o.Unsigned32
+	case ValueCounter32:
+		return v.Counter32 == o.Counter32
+	case ValueCounter64:
+		return v.Counter64 == o.Counter64
+	case ValueTimeTicks:
+		return v.TimeTicks == o.TimeTicks
+	case ValueOctetString:
+		return bytes.Equal(v.OctetString, o.OctetString)
+	case ValueReal:
+		return v.Real == o.Real
+	case ValueNoValue:
+		return true
+	default:
+		return false
+	}
+}
+
 func Integer32Value(v int32) NodeValue   { return NodeValue{Kind: ValueInteger32, Integer32: v} }
 func Unsigned32Value(v uint32) NodeValue { return NodeValue{Kind: ValueUnsigned32, Unsigned32: v} }
 func Counter32Value(v uint32) NodeValue  { return NodeValue{Kind: ValueCounter32, Counter32: v} }
@@ -131,10 +163,29 @@ type AggregationMethod struct {
 	Percentile int64 // Kind == AggPercentile, 0..100
 }
 
+type CollectionModeKind int
+
+const (
+	CollectOnce CollectionModeKind = iota
+	CollectInterval
+	CollectOnChange
+)
+
+type CollectionMode struct {
+	Kind     CollectionModeKind
+	Interval int64 // seconds; Kind == CollectInterval, must be > 0
+}
+
+func OnceMode() CollectionMode { return CollectionMode{Kind: CollectOnce} }
+func IntervalMode(seconds int64) CollectionMode {
+	return CollectionMode{Kind: CollectInterval, Interval: seconds}
+}
+func OnChangeMode() CollectionMode { return CollectionMode{Kind: CollectOnChange} }
+
 type Query struct {
 	SequenceNumber      int64
 	NodeExpression      string
-	CollectionInterval  int64 // seconds; 0 = ONCE
+	CollectionMode      CollectionMode
 	AggregationInterval *int64
 	AggregationMethod   *AggregationMethod
 	TransferInterval    int64 // seconds

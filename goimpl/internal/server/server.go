@@ -477,6 +477,12 @@ func (s treeSampler) Sample(expression string) ([]query.Sample, error) {
 	return samples, nil
 }
 
+// ChangedSince implements query.ChangeWaiter, letting a CollectOnChange
+// Runner block on the live tree's own mutations instead of polling.
+func (s treeSampler) ChangedSince(since uint64) (<-chan struct{}, uint64) {
+	return s.tree.ChangedSince(since)
+}
+
 type sessionResultSink struct{ sess *Session }
 
 func (s sessionResultSink) DeliverResults(querySeq int64, results map[string][]wire.NodeValue) error {

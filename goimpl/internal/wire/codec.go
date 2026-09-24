@@ -290,6 +290,48 @@ func decodeAggregationMethod(data []byte) (AggregationMethod, error) {
 	}
 }
 
+// --- CollectionMode (CHOICE, no outer wrapper) ------------------------------
+
+func encodeCollectionMode(buf *bytes.Buffer, m CollectionMode) {
+	switch m.Kind {
+	case CollectOnce:
+		encodeNull(buf, classContext, false, 0)
+	case CollectInterval:
+		encodeInt64(buf, classContext, false, 1, m.Interval)
+	case CollectOnChange:
+		encodeNull(buf, classContext, false, 2)
+	default:
+		panic(fmt.Sprintf("wire: invalid CollectionModeKind %d", m.Kind))
+	}
+}
+
+func decodeCollectionMode(data []byte) (CollectionMode, error) {
+	t, rest, err := readTLV(data)
+	if err != nil {
+		return CollectionMode{}, err
+	}
+	if len(rest) != 0 {
+		return CollectionMode{}, fmt.Errorf("wire: %d trailing byte(s) after CollectionMode", len(rest))
+	}
+	if t.class != classContext {
+		return CollectionMode{}, fmt.Errorf("wire: CollectionMode: expected context class, got %d", t.class)
+	}
+	switch t.tag {
+	case 0:
+		return CollectionMode{Kind: CollectOnce}, nil
+	case 1:
+		v, err := decodeInt64(t.content)
+		if err != nil {
+			return CollectionMode{}, fmt.Errorf("wire: CollectionMode.interval: %w", err)
+		}
+		return CollectionMode{Kind: CollectInterval, Interval: v}, nil
+	case 2:
+		return CollectionMode{Kind: CollectOnChange}, nil
+	default:
+		return CollectionMode{}, fmt.Errorf("wire: CollectionMode: unknown alternative tag %d", t.tag)
+	}
+}
+
 // --- Get / Set / Create / Query / Response / SummaryAck --------------------
 //
 // Each of these SEQUENCE types has two encoders: an "outer" one (universal
@@ -463,7 +505,10 @@ func UnmarshalCreate(data []byte) (*Create, error) {
 func encodeQueryFields(buf *bytes.Buffer, q *Query) {
 	encodeInt64(buf, classContext, false, 0, q.SequenceNumber)
 	encodeString(buf, classContext, false, 1, q.NodeExpression)
-	encodeInt64(buf, classContext, false, 2, q.CollectionInterval)
+	var cbuf bytes.Buffer
+	encodeCollectionMode(&cbuf, q.CollectionMode)
+	writeTagLen(buf, classContext, true, 2, cbuf.Len())
+	buf.Write(cbuf.Bytes())
 	if q.AggregationInterval != nil {
 		encodeInt64(buf, classContext, false, 3, *q.AggregationInterval)
 	}
@@ -498,10 +543,10 @@ func decodeQueryFields(content []byte) (*Query, error) {
 	q.NodeExpression = string(t.content)
 	t, rest, err = readTLV(rest)
 	if err != nil {
-		return nil, fmt.Errorf("wire: Query.collectionInterval: %w", err)
+		return nil, fmt.Errorf("wire: Query.collectionMode: %w", err)
 	}
-	if q.CollectionInterval, err = decodeInt64(t.content); err != nil {
-		return nil, fmt.Errorf("wire: Query.collectionInterval: %w", err)
+	if q.CollectionMode, err = decodeCollectionMode(t.content); err != nil {
+		return nil, fmt.Errorf("wire: Query.collectionMode: %w", err)
 	}
 
 	for len(rest) > 0 {

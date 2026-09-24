@@ -31,10 +31,51 @@ type Node struct {
 type Tree struct {
 	mu   sync.RWMutex
 	Root *Node
+
+	// changeMu/changeGen/changeCh implement a lightweight broadcast used by
+	// Query's onChange collection mode (see ChangedSince) so it can block
+	// until the next mutation instead of polling on a timer. changeGen is a
+	// monotonically increasing counter, bumped by notifyChanged on every
+	// Set/AppendUnder; changeCh is closed (and replaced) at the same time,
+	// waking anyone currently blocked on it. Tracking the generation
+	// alongside the channel, rather than relying on the channel alone, is
+	// what makes ChangedSince race-free: a caller that was busy handling
+	// one notification and only gets back around to calling ChangedSince
+	// after a second mutation already happened still sees "already stale"
+	// (since != current generation) and is woken immediately, instead of
+	// blocking on a fresh channel and missing that second mutation
+	// entirely until some third one happens to occur.
+	changeMu  sync.Mutex
+	changeGen uint64
+	changeCh  chan struct{}
 }
 
 func New() *Tree {
-	return &Tree{Root: &Node{Key: "/", Value: wire.NoValue()}}
+	return &Tree{Root: &Node{Key: "/", Value: wire.NoValue()}, changeCh: make(chan struct{})}
+}
+
+// ChangedSince returns a channel that becomes ready once the tree has been
+// mutated at least once since generation `since` -- immediately ready if
+// that has already happened -- plus the generation to pass as `since` on
+// the caller's next call. It never blocks itself; the caller selects on
+// the returned channel (typically alongside a context/ticker channel).
+func (t *Tree) ChangedSince(since uint64) (ch <-chan struct{}, gen uint64) {
+	t.changeMu.Lock()
+	defer t.changeMu.Unlock()
+	if since != t.changeGen {
+		already := make(chan struct{})
+		close(already)
+		return already, t.changeGen
+	}
+	return t.changeCh, t.changeGen
+}
+
+func (t *Tree) notifyChanged() {
+	t.changeMu.Lock()
+	defer t.changeMu.Unlock()
+	close(t.changeCh)
+	t.changeCh = make(chan struct{})
+	t.changeGen++
 }
 
 // AppendChild adds `child` as parent's last child, fixing up Parent.
@@ -421,9 +462,10 @@ func (t *Tree) ensurePathLocked(start *Node, keys []string) *Node {
 // result node generation.
 func (t *Tree) AppendUnder(parent *Node, key string, value wire.NodeValue) *Node {
 	t.mu.Lock()
-	defer t.mu.Unlock()
 	n := &Node{Key: key, Value: value}
 	AppendChild(parent, n)
+	t.mu.Unlock()
+	t.notifyChanged()
 	return n
 }
 
@@ -435,6 +477,14 @@ func (t *Tree) AppendUnder(parent *Node, key string, value wire.NodeValue) *Node
 // and rejected, since offsets are only meaningful inside a server-generated
 // flattened Response.
 func (t *Tree) Set(s *wire.Set) error {
+	if err := t.setLocked(s); err != nil {
+		return err
+	}
+	t.notifyChanged()
+	return nil
+}
+
+func (t *Tree) setLocked(s *wire.Set) error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 

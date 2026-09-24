@@ -34,7 +34,7 @@ func main() {
 		fmt.Fprintf(os.Stderr, "  get <expression>\n")
 		fmt.Fprintf(os.Stderr, "  set <expression> [--value V] [--first-child EXPR|none] [--next-sibling EXPR|none]\n")
 		fmt.Fprintf(os.Stderr, "  create <key> [value]\n")
-		fmt.Fprintf(os.Stderr, "  query <expression> --collection SECONDS --transfer SECONDS [--agg-interval SECONDS --agg-method min|max|mean|stddev|pNN]\n")
+		fmt.Fprintf(os.Stderr, "  query <expression> [--collection SECONDS | --on-change] --transfer SECONDS [--agg-interval SECONDS --agg-method min|max|mean|stddev|pNN]\n")
 	}
 	flag.Parse()
 	args := flag.Args()
@@ -373,21 +373,30 @@ func runCreate(ctx context.Context, c *client, args []string) {
 
 func runQuery(ctx context.Context, c *client, args []string) {
 	fs := flag.NewFlagSet("query", flag.ExitOnError)
-	collection := fs.Int64("collection", 0, "collection interval in seconds (0 = ONCE)")
+	collection := fs.Int64("collection", 0, "collection interval in seconds (0 = ONCE); ignored if --on-change")
+	onChange := fs.Bool("on-change", false, "collect only when a matched value actually changes, event-triggered instead of on a timer")
 	transfer := fs.Int64("transfer", 0, "transfer interval in seconds")
 	aggInterval := fs.Int64("agg-interval", 0, "aggregation interval in seconds (0 = no aggregation)")
 	aggMethod := fs.String("agg-method", "", "min|max|mean|stddev|pNN (e.g. p95)")
 	watch := fs.Duration("watch", 10*time.Second, "how long to keep printing pushed results before exiting")
 	fs.Parse(args)
 	if fs.NArg() != 1 {
-		fmt.Fprintln(os.Stderr, "usage: query <expression> --collection SECONDS --transfer SECONDS [--agg-interval SECONDS --agg-method min|max|mean|stddev|pNN] [--watch DURATION]")
+		fmt.Fprintln(os.Stderr, "usage: query <expression> [--collection SECONDS | --on-change] --transfer SECONDS [--agg-interval SECONDS --agg-method min|max|mean|stddev|pNN] [--watch DURATION]")
 		os.Exit(2)
 	}
 
+	mode := wire.IntervalMode(*collection)
+	if *collection == 0 {
+		mode = wire.OnceMode()
+	}
+	if *onChange {
+		mode = wire.OnChangeMode()
+	}
+
 	q := &wire.Query{
-		NodeExpression:     fs.Arg(0),
-		CollectionInterval: *collection,
-		TransferInterval:   *transfer,
+		NodeExpression:   fs.Arg(0),
+		CollectionMode:   mode,
+		TransferInterval: *transfer,
 	}
 	if *aggInterval > 0 {
 		q.AggregationInterval = aggInterval
@@ -424,19 +433,19 @@ func runQuery(ctx context.Context, c *client, args []string) {
 	if err != nil {
 		log.Fatalf("query: %v", err)
 	}
-	// For a recurring query this is always the empty registration ack
-	// (results arrive later via pushHandler). For a ONCE query
-	// (collectionInterval=0), the server runs the whole collect/aggregate/
-	// transfer pipeline synchronously before sending that ack, so the
-	// first response received here is often the actual result instead --
-	// label by content, not by assumed arrival order.
+	// For a recurring (interval or onChange) query this is always the
+	// empty registration ack (results arrive later via pushHandler). For a
+	// ONCE query, the server runs the whole collect/aggregate/transfer
+	// pipeline synchronously before sending that ack, so the first
+	// response received here is often the actual result instead -- label
+	// by content, not by assumed arrival order.
 	if len(resp.Nodes) == 0 {
 		printResponse("query registered", resp)
 	} else {
 		printResponse(fmt.Sprintf("query push (seq %d)", resp.SequenceNumber), resp)
 	}
 
-	if *collection == 0 {
+	if mode.Kind == wire.CollectOnce {
 		// ONCE: the server already ran the whole pipeline synchronously
 		// and its one push may already be in flight; give it a moment.
 		time.Sleep(500 * time.Millisecond)

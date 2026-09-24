@@ -3,7 +3,9 @@ package query
 import (
 	"context"
 	"math"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/shashi/snmp-ng/goimpl/internal/wire"
 )
@@ -78,13 +80,18 @@ type fakeSampler struct {
 
 func (f *fakeSampler) Sample(expression string) ([]Sample, error) { return f.samples, f.err }
 
+// fakeSink is shared between the calling goroutine and, for interval/
+// onChange queries, Runner's own background goroutine -- guarded by mu.
 type fakeSink struct {
+	mu        sync.Mutex
 	delivered map[string][]wire.NodeValue
 	querySeq  int64
 	calls     int
 }
 
 func (f *fakeSink) DeliverResults(querySeq int64, results map[string][]wire.NodeValue) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.delivered = results
 	f.querySeq = querySeq
 	f.calls++
@@ -96,7 +103,7 @@ func TestRunnerOnceNoAggregation(t *testing.T) {
 		{Key: "timeout", Value: wire.Integer32Value(30)},
 	}}
 	sink := &fakeSink{}
-	q := wire.Query{SequenceNumber: 42, NodeExpression: "/config/timeout", CollectionInterval: 0, TransferInterval: 0}
+	q := wire.Query{SequenceNumber: 42, NodeExpression: "/config/timeout", CollectionMode: wire.OnceMode(), TransferInterval: 0}
 	r := NewRunner(q, sampler, sink)
 	r.Start(context.Background())
 
@@ -121,7 +128,7 @@ func TestRunnerOnceWithAggregation(t *testing.T) {
 	aggInterval := int64(1)
 	q := wire.Query{
 		SequenceNumber: 1, NodeExpression: "/config/timeout",
-		CollectionInterval: 0, AggregationInterval: &aggInterval, AggregationMethod: &agg, TransferInterval: 0,
+		CollectionMode: wire.OnceMode(), AggregationInterval: &aggInterval, AggregationMethod: &agg, TransferInterval: 0,
 	}
 	r := NewRunner(q, sampler, sink)
 	r.Start(context.Background())
@@ -129,6 +136,134 @@ func TestRunnerOnceWithAggregation(t *testing.T) {
 	got := sink.delivered["timeout"]
 	if len(got) != 1 || got[0].Kind != wire.ValueReal || !almostEqual(got[0].Real, 30) {
 		t.Fatalf("delivered = %+v", sink.delivered)
+	}
+}
+
+// --- Runner pipeline (onChange path, driven by a fake ChangeWaiter) --------
+
+// fakeChangeSampler is a Sampler + ChangeWaiter a test can drive
+// deterministically -- push a new snapshot of samples and fire the change
+// signal -- instead of relying on real tree mutations or timers.
+type fakeChangeSampler struct {
+	mu      sync.Mutex
+	samples []Sample
+	gen     uint64
+	ch      chan struct{}
+}
+
+func newFakeChangeSampler(initial []Sample) *fakeChangeSampler {
+	return &fakeChangeSampler{samples: initial, ch: make(chan struct{})}
+}
+
+func (f *fakeChangeSampler) Sample(expression string) ([]Sample, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([]Sample, len(f.samples))
+	copy(out, f.samples)
+	return out, nil
+}
+
+func (f *fakeChangeSampler) ChangedSince(since uint64) (<-chan struct{}, uint64) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if since != f.gen {
+		already := make(chan struct{})
+		close(already)
+		return already, f.gen
+	}
+	return f.ch, f.gen
+}
+
+// push replaces the current samples and wakes anyone waiting in
+// ChangedSince, simulating a tree mutation.
+func (f *fakeChangeSampler) push(samples []Sample) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.samples = samples
+	close(f.ch)
+	f.ch = make(chan struct{})
+	f.gen++
+}
+
+// waitForCalls blocks until sink has recorded at least n DeliverResults
+// calls, or fails the test after a generous timeout -- avoids sleep-based
+// flakiness while still bounding a runaway test.
+func waitForCalls(t *testing.T, sink *fakeSink, n int) {
+	t.Helper()
+	deadline := time.After(2 * time.Second)
+	for {
+		sink.mu.Lock()
+		calls := sink.calls
+		sink.mu.Unlock()
+		if calls >= n {
+			return
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("timed out waiting for %d DeliverResults call(s), got %d", n, calls)
+		case <-time.After(5 * time.Millisecond):
+		}
+	}
+}
+
+func TestRunnerOnChangeDeliversBaselineImmediately(t *testing.T) {
+	sampler := newFakeChangeSampler([]Sample{{Key: "ifOperStatus", Value: wire.Integer32Value(1)}})
+	sink := &fakeSink{}
+	q := wire.Query{SequenceNumber: 1, NodeExpression: "/interfaces/ifOperStatus", CollectionMode: wire.OnChangeMode(), TransferInterval: 3600}
+	r := NewRunner(q, sampler, sink)
+	r.Start(context.Background())
+	defer r.Stop()
+
+	waitForCalls(t, sink, 1)
+	sink.mu.Lock()
+	got := sink.delivered["ifOperStatus"]
+	sink.mu.Unlock()
+	if len(got) != 1 || got[0].Integer32 != 1 {
+		t.Fatalf("baseline delivered = %+v", got)
+	}
+}
+
+func TestRunnerOnChangeSkipsUnchangedValues(t *testing.T) {
+	sampler := newFakeChangeSampler([]Sample{{Key: "ifOperStatus", Value: wire.Integer32Value(1)}})
+	sink := &fakeSink{}
+	q := wire.Query{SequenceNumber: 1, NodeExpression: "/interfaces/ifOperStatus", CollectionMode: wire.OnChangeMode(), TransferInterval: 3600}
+	r := NewRunner(q, sampler, sink)
+	r.Start(context.Background())
+	defer r.Stop()
+	waitForCalls(t, sink, 1) // baseline
+
+	// An unrelated mutation fires the change signal, but the sampled value
+	// is identical to what was already reported: nothing new to deliver.
+	sampler.push([]Sample{{Key: "ifOperStatus", Value: wire.Integer32Value(1)}})
+	time.Sleep(50 * time.Millisecond)
+	sink.mu.Lock()
+	calls := sink.calls
+	sink.mu.Unlock()
+	if calls != 1 {
+		t.Fatalf("calls = %d after an unchanged value, want 1 (no spurious delivery)", calls)
+	}
+}
+
+func TestRunnerOnChangeDeliversOnRealChange(t *testing.T) {
+	sampler := newFakeChangeSampler([]Sample{{Key: "ifOperStatus", Value: wire.Integer32Value(1)}})
+	sink := &fakeSink{}
+	q := wire.Query{
+		SequenceNumber: 1, NodeExpression: "/interfaces/ifOperStatus",
+		CollectionMode: wire.OnChangeMode(), TransferInterval: 1, // 1s: short enough for the test to observe promptly
+	}
+	r := NewRunner(q, sampler, sink)
+	r.Start(context.Background())
+	defer r.Stop()
+	waitForCalls(t, sink, 1) // baseline: status=1 (up)
+
+	sampler.push([]Sample{{Key: "ifOperStatus", Value: wire.Integer32Value(2)}}) // link goes down
+	waitForCalls(t, sink, 2)
+
+	sink.mu.Lock()
+	got := sink.delivered["ifOperStatus"]
+	sink.mu.Unlock()
+	if len(got) != 1 || got[0].Integer32 != 2 {
+		t.Fatalf("second delivery = %+v, want a single sample with value 2", got)
 	}
 }
 
@@ -140,12 +275,15 @@ func TestValidateQuery(t *testing.T) {
 		q    wire.Query
 		ok   bool
 	}{
-		{"once, no aggregation", wire.Query{CollectionInterval: 0, TransferInterval: 0}, true},
-		{"recurring, no transfer", wire.Query{CollectionInterval: 60, TransferInterval: 0}, false},
-		{"recurring with transfer", wire.Query{CollectionInterval: 60, TransferInterval: 600}, true},
-		{"aggInterval without method", wire.Query{CollectionInterval: 60, TransferInterval: 600, AggregationInterval: &interval}, false},
-		{"method without aggInterval", wire.Query{CollectionInterval: 60, TransferInterval: 600, AggregationMethod: &agg}, false},
-		{"both present", wire.Query{CollectionInterval: 60, TransferInterval: 600, AggregationInterval: &interval, AggregationMethod: &agg}, true},
+		{"once, no aggregation", wire.Query{CollectionMode: wire.OnceMode(), TransferInterval: 0}, true},
+		{"interval, no transfer", wire.Query{CollectionMode: wire.IntervalMode(60), TransferInterval: 0}, false},
+		{"interval with transfer", wire.Query{CollectionMode: wire.IntervalMode(60), TransferInterval: 600}, true},
+		{"interval with non-positive interval", wire.Query{CollectionMode: wire.IntervalMode(0), TransferInterval: 600}, false},
+		{"onChange, no transfer", wire.Query{CollectionMode: wire.OnChangeMode(), TransferInterval: 0}, false},
+		{"onChange with transfer", wire.Query{CollectionMode: wire.OnChangeMode(), TransferInterval: 5}, true},
+		{"aggInterval without method", wire.Query{CollectionMode: wire.IntervalMode(60), TransferInterval: 600, AggregationInterval: &interval}, false},
+		{"method without aggInterval", wire.Query{CollectionMode: wire.IntervalMode(60), TransferInterval: 600, AggregationMethod: &agg}, false},
+		{"both present", wire.Query{CollectionMode: wire.IntervalMode(60), TransferInterval: 600, AggregationInterval: &interval, AggregationMethod: &agg}, true},
 	}
 	for _, c := range cases {
 		err := ValidateQuery(&c.q)

@@ -61,7 +61,7 @@ cases = {
         {
             "sequenceNumber": 5,
             "nodeExpression": "/config/timeout",
-            "collectionInterval": 300,
+            "collectionMode": ("interval", 300),
             "aggregationInterval": 600,
             "aggregationMethod": ("mean", None),
             "transferInterval": 6000,
@@ -72,8 +72,17 @@ cases = {
         {
             "sequenceNumber": 6,
             "nodeExpression": "/config/timeout",
-            "collectionInterval": 0,
+            "collectionMode": ("once", None),
             "transferInterval": 0,
+        },
+    ),
+    "Query_onChange": (
+        "Query",
+        {
+            "sequenceNumber": 9,
+            "nodeExpression": "/interfaces/ifOperStatus",
+            "collectionMode": ("onChange", None),
+            "transferInterval": 5,
         },
     ),
     "Response_ok": ("Response", {"sequenceNumber": 7, "inReplyTo": 1, "error": False, "nodes": [node]}),
