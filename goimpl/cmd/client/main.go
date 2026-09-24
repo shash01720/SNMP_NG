@@ -24,6 +24,14 @@ const (
 	maxRetransmits     = 8
 	ackInterval        = 100 * time.Millisecond
 	requestTimeout     = 5 * time.Second
+
+	// maxIdleTimeout/keepAlivePeriod: see cmd/server/main.go's doc comment
+	// on the same constants -- both sides need this set, not just one, so
+	// a long `query --on-change --watch` sitting quietly survives quic-go's
+	// own idle timeout regardless of which direction happens to go quiet
+	// first.
+	maxIdleTimeout  = 30 * time.Second
+	keepAlivePeriod = 10 * time.Second
 )
 
 func main() {
@@ -44,10 +52,19 @@ func main() {
 		os.Exit(2)
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-	defer cancel()
+	// No overall timeout here: a hardcoded one previously capped every
+	// invocation's total lifetime, which silently killed any `query
+	// --on-change --watch` (or plain --watch) longer than that cap,
+	// independent of whether the QUIC connection itself would have
+	// survived. Bounding is left to what actually needs it -- each
+	// request's own requestTimeout, and query's own --watch duration.
+	ctx := context.Background()
 
-	conn, err := quic.DialAddr(ctx, *addr, certs.ClientConfig(), &quic.Config{EnableDatagrams: true})
+	conn, err := quic.DialAddr(ctx, *addr, certs.ClientConfig(), &quic.Config{
+		EnableDatagrams: true,
+		MaxIdleTimeout:  maxIdleTimeout,
+		KeepAlivePeriod: keepAlivePeriod,
+	})
 	if err != nil {
 		log.Fatalf("dial: %v", err)
 	}

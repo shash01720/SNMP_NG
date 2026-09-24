@@ -8,12 +8,27 @@ import (
 	"log"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/quic-go/quic-go"
 
 	"github.com/shashi/snmp-ng/goimpl/internal/certs"
 	"github.com/shashi/snmp-ng/goimpl/internal/server"
 	"github.com/shashi/snmp-ng/goimpl/internal/wire"
+)
+
+// maxIdleTimeout/keepAlivePeriod: quic-go's own default (30s idle timeout,
+// no keep-alive) is enough to silently drop a long-lived, low-traffic
+// connection -- exactly what an onChange Query sitting quietly between
+// rare events needs to survive. Set explicitly here (rather than relying
+// on the implicit default) so the relationship between the two is
+// intentional: quic-go clamps any keep-alive period to at most half of
+// MaxIdleTimeout, so 10s against a 30s idle timeout leaves real margin for
+// a lost keep-alive packet or scheduling jitter before the connection
+// would actually be at risk.
+const (
+	maxIdleTimeout  = 30 * time.Second
+	keepAlivePeriod = 10 * time.Second
 )
 
 func overrideSuffix(n int) string {
@@ -41,6 +56,8 @@ func main() {
 
 	ln, err := quic.ListenAddr(*addr, tlsConf, &quic.Config{
 		EnableDatagrams: true,
+		MaxIdleTimeout:  maxIdleTimeout,
+		KeepAlivePeriod: keepAlivePeriod,
 	})
 	if err != nil {
 		log.Fatalf("listen: %v", err)

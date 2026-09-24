@@ -76,7 +76,7 @@ type Session struct {
 	nextSeq int64
 
 	respCacheMu sync.Mutex
-	respCache   map[int64]*wire.Response // keyed by the request's own sequenceNumber
+	respCache   map[int64]cachedResponse // keyed by the request's own sequenceNumber
 
 	queriesMu     sync.Mutex
 	activeQueries map[int64]*query.Runner
@@ -133,7 +133,7 @@ func (s *Server) newSession(conn *quic.Conn) *Session {
 		ID:            id,
 		server:        s,
 		conn:          conn,
-		respCache:     make(map[int64]*wire.Response),
+		respCache:     make(map[int64]cachedResponse),
 		activeQueries: make(map[int64]*query.Runner),
 	}
 	base := s.Tree.EnsurePath("Sessions", "Connection-ID="+id)
@@ -249,7 +249,7 @@ func (sess *Session) handleMessage(ctx context.Context, msg wire.Message) {
 			cached, have := sess.respCache[seq]
 			sess.respCacheMu.Unlock()
 			if have {
-				sess.sendResponse(cached)
+				sess.sendResponse(cached.resp)
 			}
 			return
 		}
@@ -285,11 +285,40 @@ func (sess *Session) sendResponse(resp *wire.Response) {
 
 // respondAndCache sends resp and caches it under requestSeq, for dedup
 // (see handleMessage).
+// respCacheTTL bounds respCache's lifetime, not its size: an entry only
+// needs to survive long enough to answer a retransmitted duplicate of the
+// request it belongs to, and the client's own sender gives up retrying
+// after maxRetransmits * retransmitInterval (2s at current settings). 30s
+// is a generous multiple of that -- comfortable margin for scheduling
+// jitter -- while still keeping the map's size bounded by recent traffic
+// rather than growing for a session's entire (potentially very long)
+// lifetime, which respCache did until this was added.
+const respCacheTTL = 30 * time.Second
+
+type cachedResponse struct {
+	resp *wire.Response
+	at   time.Time
+}
+
 func (sess *Session) respondAndCache(requestSeq int64, resp *wire.Response) {
 	sess.sendResponse(resp)
+	sess.cacheResponse(requestSeq, resp)
+}
+
+// cacheResponse records resp and sweeps any entry older than respCacheTTL.
+// Sweeping on every insert (rather than on a separate ticker) needs no
+// extra goroutine and keeps the map small in practice, since it only ever
+// holds entries from roughly the last respCacheTTL of traffic.
+func (sess *Session) cacheResponse(requestSeq int64, resp *wire.Response) {
 	sess.respCacheMu.Lock()
-	sess.respCache[requestSeq] = resp
-	sess.respCacheMu.Unlock()
+	defer sess.respCacheMu.Unlock()
+	now := time.Now()
+	sess.respCache[requestSeq] = cachedResponse{resp: resp, at: now}
+	for seq, c := range sess.respCache {
+		if now.Sub(c.at) > respCacheTTL {
+			delete(sess.respCache, seq)
+		}
+	}
 }
 
 // sendFittedNodes sends flat[resumeIndex:] as a Response to requestSeq,
@@ -330,9 +359,7 @@ func (sess *Session) sendFittedNodes(requestSeq int64, flat []wire.Node, resumeI
 
 		err := sess.sender.Send(txSeq, payload)
 		if err == nil {
-			sess.respCacheMu.Lock()
-			sess.respCache[requestSeq] = resp
-			sess.respCacheMu.Unlock()
+			sess.cacheResponse(requestSeq, resp)
 			return
 		}
 
@@ -500,6 +527,22 @@ func (sess *Session) handleQuery(ctx context.Context, q *wire.Query) {
 	sess.queriesMu.Unlock()
 
 	runner.Start(ctx)
+
+	if q.CollectionMode.Kind == wire.CollectOnce {
+		// Start already ran the whole collect/aggregate/transfer pipeline
+		// synchronously and returned -- there's no goroutine left running
+		// for this entry to track, so don't let a session that issues many
+		// ONCE queries over a long lifetime accumulate a dead entry per
+		// query forever. Interval/onChange queries stay in the map: they
+		// have a real background goroutine, and there's no per-query
+		// cancel yet (see README's Known gaps) to hook cleanup to besides
+		// session teardown, which already stops them via run()'s deferred
+		// loop over activeQueries.
+		sess.queriesMu.Lock()
+		delete(sess.activeQueries, q.SequenceNumber)
+		sess.queriesMu.Unlock()
+	}
+
 	// Acknowledge registration immediately, distinct from the (possibly
 	// later, possibly repeated) result pushes that share the same
 	// InReplyTo -- the client tells them apart by content (this one always

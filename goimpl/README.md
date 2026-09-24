@@ -100,6 +100,16 @@ Note: flags must come *before* the positional expression (Go's `flag`
 package stops parsing at the first non-flag argument) --
 `set --value X "/expr"`, not `set "/expr" --value X`.
 
+A `--watch` on `query --on-change` is exactly the case that needs a
+genuinely long-lived, mostly-quiet connection: both `cmd/server` and
+`cmd/client` set `MaxIdleTimeout`/`KeepAlivePeriod` in their `quic.Config`
+explicitly (30s/10s) so quic-go's own idle timeout doesn't silently drop a
+connection sitting quietly between rare events -- without this, the
+default `KeepAlivePeriod` is disabled, and a connection with nothing to
+acknowledge in either direction for 30s is torn down by QUIC itself,
+independent of anything at the application layer. Verified by watching a
+genuinely idle connection (no `Set` calls at all) survive 40s.
+
 ### Real IF-MIB demo data
 
 Alongside the toy `users`/`config` tree, the server seeds a second,
