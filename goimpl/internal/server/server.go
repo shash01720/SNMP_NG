@@ -81,22 +81,47 @@ type Session struct {
 	queriesMu     sync.Mutex
 	activeQueries map[int64]*query.Runner
 
-	// maxDatagramMu/maxDatagramSize: this connection's discovered (or
-	// overridden) per-datagram payload budget. 0 means "not yet learned";
-	// sendFittedNodes/sendBatched discover it lazily from the first
-	// quic.DatagramTooLargeError, and cache it here so later sends in the
-	// same session don't have to rediscover it.
+	// overrideSize is a copy of Server.MaxDatagramSizeOverride, fixed at
+	// session creation and never mutated afterward -- safe to read without
+	// a lock. When set (>0), getMaxDatagramSize always returns it rather
+	// than a discovered value: see setMaxDatagramSize for why.
+	overrideSize int
+
+	// maxDatagramMu/maxDatagramSize: this connection's discovered
+	// per-datagram payload budget, used only when overrideSize is unset.
+	// 0 means "not yet learned"; sendFittedNodes/sendBatched discover it
+	// lazily from the first quic.DatagramTooLargeError, and cache it here
+	// so later sends in the same session don't have to rediscover it.
 	maxDatagramMu   sync.Mutex
 	maxDatagramSize int
 }
 
+// getMaxDatagramSize returns the size a new top-level send should start
+// from: the operator's override if one is configured, else the last
+// discovered real limit (0 if none yet).
 func (sess *Session) getMaxDatagramSize() int {
+	if sess.overrideSize > 0 {
+		return sess.overrideSize
+	}
 	sess.maxDatagramMu.Lock()
 	defer sess.maxDatagramMu.Unlock()
 	return sess.maxDatagramSize
 }
 
+// setMaxDatagramSize records a real DatagramTooLargeError-discovered limit
+// for future top-level sends in this session. It is a no-op when an
+// override is configured: QUIC's path MTU discovery ramps up over a
+// connection's lifetime (RFC 9000), so a single early failure -- often
+// just the conservative startup size, not the path's real ceiling --
+// shouldn't permanently pin every later send below the size the operator
+// explicitly asked for. getMaxDatagramSize keeps returning the override so
+// each new request retries at it; the discovered value passed here is
+// still used directly by the caller to fit and retry the one send that
+// just failed.
 func (sess *Session) setMaxDatagramSize(n int) {
+	if sess.overrideSize > 0 {
+		return
+	}
 	sess.maxDatagramMu.Lock()
 	defer sess.maxDatagramMu.Unlock()
 	sess.maxDatagramSize = n
@@ -122,9 +147,7 @@ func (s *Server) newSession(conn *quic.Conn) *Session {
 		log.Printf("[server] session %s: giving up on unacked datagram (seq %d) after %d attempts", id, seq, maxRetransmits)
 	})
 	sess.receiver = reliability.NewReceiver()
-	if s.MaxDatagramSizeOverride > 0 {
-		sess.maxDatagramSize = s.MaxDatagramSizeOverride
-	}
+	sess.overrideSize = s.MaxDatagramSizeOverride
 	return sess
 }
 
@@ -277,9 +300,11 @@ func (sess *Session) respondAndCache(requestSeq int64, resp *wire.Response) {
 // "max datagram size" query, only a quic.DatagramTooLargeError returned
 // from a failed send naming the actual limit (Conn.SendDatagram's doc
 // comment). The optimistic first attempt sends the untruncated remainder
-// directly; on DatagramTooLargeError, the discovered limit is cached on
-// the session (so later sends in the same session skip straight to
-// fitting) and a corrected, fitted payload is sent instead.
+// directly; on DatagramTooLargeError, a corrected, fitted payload is sent
+// instead. When no --max-datagram-size override is configured, the
+// discovered limit is also cached on the session so later sends in the
+// same session skip straight to fitting; see setMaxDatagramSize for why
+// that caching is skipped when an override is set.
 func (sess *Session) sendFittedNodes(requestSeq int64, flat []wire.Node, resumeIndex int, baseExpression string) {
 	txSeq := sess.allocSeq()
 	build := func(nodes []wire.Node) *wire.Response {
