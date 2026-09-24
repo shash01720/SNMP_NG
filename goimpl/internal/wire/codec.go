@@ -379,18 +379,78 @@ func UnmarshalGet(data []byte) (*Get, error) {
 	return decodeGetFields(content)
 }
 
+func encodeSetEditFields(buf *bytes.Buffer, e SetEdit) {
+	encodeString(buf, classContext, false, 0, e.Target)
+	if e.NewValue != nil {
+		writeExplicitValue(buf, 1, *e.NewValue)
+	}
+	if e.NewFirstChild != nil {
+		writeExplicitPointer(buf, 2, *e.NewFirstChild)
+	}
+	if e.NewNextSibling != nil {
+		writeExplicitPointer(buf, 3, *e.NewNextSibling)
+	}
+}
+
+// encodeSetEditWrapped writes one SetEdit as it appears inside a SEQUENCE
+// OF SetEdit: a normal universal-SEQUENCE-tagged SetEdit, mirroring
+// encodeNodeFieldsWrapped/encodeSequenceRangeWrapped.
+func encodeSetEditWrapped(buf *bytes.Buffer, e SetEdit) {
+	var fields bytes.Buffer
+	encodeSetEditFields(&fields, e)
+	writeTagLen(buf, classUniversal, true, tagSequence, fields.Len())
+	buf.Write(fields.Bytes())
+}
+
+func decodeSetEditFields(content []byte) (SetEdit, error) {
+	e := SetEdit{}
+	t, rest, err := readTLV(content)
+	if err != nil {
+		return SetEdit{}, fmt.Errorf("wire: SetEdit.target: %w", err)
+	}
+	if t.tag != 0 {
+		return SetEdit{}, fmt.Errorf("wire: SetEdit: expected target (tag 0), got tag %d", t.tag)
+	}
+	e.Target = string(t.content)
+	for len(rest) > 0 {
+		t, rest, err = readTLV(rest)
+		if err != nil {
+			return SetEdit{}, fmt.Errorf("wire: SetEdit: %w", err)
+		}
+		switch t.tag {
+		case 1:
+			v, err := decodeNodeValue(t.content)
+			if err != nil {
+				return SetEdit{}, fmt.Errorf("wire: SetEdit.newValue: %w", err)
+			}
+			e.NewValue = &v
+		case 2:
+			p, err := decodeNodePointer(t.content)
+			if err != nil {
+				return SetEdit{}, fmt.Errorf("wire: SetEdit.newFirstChild: %w", err)
+			}
+			e.NewFirstChild = &p
+		case 3:
+			p, err := decodeNodePointer(t.content)
+			if err != nil {
+				return SetEdit{}, fmt.Errorf("wire: SetEdit.newNextSibling: %w", err)
+			}
+			e.NewNextSibling = &p
+		default:
+			return SetEdit{}, fmt.Errorf("wire: SetEdit: unexpected field tag %d", t.tag)
+		}
+	}
+	return e, nil
+}
+
 func encodeSetFields(buf *bytes.Buffer, s *Set) {
 	encodeInt64(buf, classContext, false, 0, s.SequenceNumber)
-	writeExplicitPointer(buf, 1, s.Target)
-	if s.NewValue != nil {
-		writeExplicitValue(buf, 2, *s.NewValue)
+	var ebuf bytes.Buffer
+	for _, e := range s.Edits {
+		encodeSetEditWrapped(&ebuf, e)
 	}
-	if s.NewFirstChild != nil {
-		writeExplicitPointer(buf, 3, *s.NewFirstChild)
-	}
-	if s.NewNextSibling != nil {
-		writeExplicitPointer(buf, 4, *s.NewNextSibling)
-	}
+	writeTagLen(buf, classContext, true, 1, ebuf.Len())
+	buf.Write(ebuf.Bytes())
 }
 
 func MarshalSet(s *Set) []byte { return wrapSequence(encodeSetFields, s) }
@@ -406,38 +466,29 @@ func decodeSetFields(content []byte) (*Set, error) {
 	}
 	t, rest, err = readTLV(rest)
 	if err != nil {
-		return nil, fmt.Errorf("wire: Set.target: %w", err)
+		return nil, fmt.Errorf("wire: Set.edits: %w", err)
 	}
-	if s.Target, err = decodeNodePointer(t.content); err != nil {
-		return nil, fmt.Errorf("wire: Set.target: %w", err)
+	if t.tag != 1 {
+		return nil, fmt.Errorf("wire: Set: expected edits (tag 1), got tag %d", t.tag)
 	}
-	for len(rest) > 0 {
-		t, rest, err = readTLV(rest)
+	editsContent := t.content
+	for len(editsContent) > 0 {
+		var et tlv
+		et, editsContent, err = readTLV(editsContent)
 		if err != nil {
-			return nil, fmt.Errorf("wire: Set: %w", err)
+			return nil, fmt.Errorf("wire: Set.edits: %w", err)
 		}
-		switch t.tag {
-		case 2:
-			v, err := decodeNodeValue(t.content)
-			if err != nil {
-				return nil, fmt.Errorf("wire: Set.newValue: %w", err)
-			}
-			s.NewValue = &v
-		case 3:
-			p, err := decodeNodePointer(t.content)
-			if err != nil {
-				return nil, fmt.Errorf("wire: Set.newFirstChild: %w", err)
-			}
-			s.NewFirstChild = &p
-		case 4:
-			p, err := decodeNodePointer(t.content)
-			if err != nil {
-				return nil, fmt.Errorf("wire: Set.newNextSibling: %w", err)
-			}
-			s.NewNextSibling = &p
-		default:
-			return nil, fmt.Errorf("wire: Set: unexpected field tag %d", t.tag)
+		if et.class != classUniversal || et.tag != tagSequence {
+			return nil, fmt.Errorf("wire: Set.edits: element is not a SEQUENCE (class=%d tag=%d)", et.class, et.tag)
 		}
+		edit, err := decodeSetEditFields(et.content)
+		if err != nil {
+			return nil, fmt.Errorf("wire: Set.edits: %w", err)
+		}
+		s.Edits = append(s.Edits, edit)
+	}
+	if len(rest) != 0 {
+		return nil, fmt.Errorf("wire: %d trailing byte(s) after Set", len(rest))
 	}
 	return s, nil
 }
@@ -448,6 +499,60 @@ func UnmarshalSet(data []byte) (*Set, error) {
 		return nil, err
 	}
 	return decodeSetFields(content)
+}
+
+func encodeDeleteFields(buf *bytes.Buffer, d *Delete) {
+	encodeInt64(buf, classContext, false, 0, d.SequenceNumber)
+	var tbuf bytes.Buffer
+	for _, target := range d.Targets {
+		encodeString(&tbuf, classUniversal, false, tagUTF8String, target)
+	}
+	writeTagLen(buf, classContext, true, 1, tbuf.Len())
+	buf.Write(tbuf.Bytes())
+}
+
+func MarshalDelete(d *Delete) []byte { return wrapSequence(encodeDeleteFields, d) }
+
+func decodeDeleteFields(content []byte) (*Delete, error) {
+	d := &Delete{}
+	t, rest, err := readTLV(content)
+	if err != nil {
+		return nil, fmt.Errorf("wire: Delete.sequenceNumber: %w", err)
+	}
+	if d.SequenceNumber, err = decodeInt64(t.content); err != nil {
+		return nil, fmt.Errorf("wire: Delete.sequenceNumber: %w", err)
+	}
+	t, rest, err = readTLV(rest)
+	if err != nil {
+		return nil, fmt.Errorf("wire: Delete.targets: %w", err)
+	}
+	if t.tag != 1 {
+		return nil, fmt.Errorf("wire: Delete: expected targets (tag 1), got tag %d", t.tag)
+	}
+	targetsContent := t.content
+	for len(targetsContent) > 0 {
+		var tt tlv
+		tt, targetsContent, err = readTLV(targetsContent)
+		if err != nil {
+			return nil, fmt.Errorf("wire: Delete.targets: %w", err)
+		}
+		if tt.class != classUniversal || tt.tag != tagUTF8String {
+			return nil, fmt.Errorf("wire: Delete.targets: element is not a UTF8String (class=%d tag=%d)", tt.class, tt.tag)
+		}
+		d.Targets = append(d.Targets, string(tt.content))
+	}
+	if len(rest) != 0 {
+		return nil, fmt.Errorf("wire: %d trailing byte(s) after Delete", len(rest))
+	}
+	return d, nil
+}
+
+func UnmarshalDelete(data []byte) (*Delete, error) {
+	content, err := unwrapSequence(data, "Delete")
+	if err != nil {
+		return nil, err
+	}
+	return decodeDeleteFields(content)
 }
 
 func encodeCreateFields(buf *bytes.Buffer, c *Create) {
@@ -788,6 +893,8 @@ func MarshalMessage(m Message) []byte {
 		writeImplicitInto(&buf, 4, encodeResponseFields, m.Response)
 	case MsgSummaryAck:
 		writeImplicitInto(&buf, 5, encodeSummaryAckFields, m.SummaryAck)
+	case MsgDelete:
+		writeImplicitInto(&buf, 6, encodeDeleteFields, m.Delete)
 	default:
 		panic(fmt.Sprintf("wire: invalid MessageKind %d", m.Kind))
 	}
@@ -842,6 +949,12 @@ func UnmarshalMessage(data []byte) (Message, error) {
 			return Message{}, err
 		}
 		return Message{Kind: MsgSummaryAck, SummaryAck: a}, nil
+	case 6:
+		d, err := decodeDeleteFields(t.content)
+		if err != nil {
+			return Message{}, err
+		}
+		return Message{Kind: MsgDelete, Delete: d}, nil
 	default:
 		return Message{}, fmt.Errorf("wire: NodeTreeMessage: unknown alternative tag %d", t.tag)
 	}

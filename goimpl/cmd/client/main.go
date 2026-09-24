@@ -32,7 +32,8 @@ func main() {
 		fmt.Fprintf(os.Stderr, "usage: %s [-addr host:port] <command> [args...]\n\n", os.Args[0])
 		fmt.Fprintf(os.Stderr, "commands:\n")
 		fmt.Fprintf(os.Stderr, "  get <expression>\n")
-		fmt.Fprintf(os.Stderr, "  set <expression> [--value V] [--first-child EXPR|none] [--next-sibling EXPR|none]\n")
+		fmt.Fprintf(os.Stderr, "  set [--value V] [--first-child EXPR|none] [--next-sibling EXPR|none] <expression> [expression...]\n")
+		fmt.Fprintf(os.Stderr, "  delete <expression> [expression...]\n")
 		fmt.Fprintf(os.Stderr, "  create <key> [value]\n")
 		fmt.Fprintf(os.Stderr, "  query <expression> [--collection SECONDS | --on-change] --transfer SECONDS [--agg-interval SECONDS --agg-method min|max|mean|stddev|pNN]\n")
 	}
@@ -62,6 +63,8 @@ func main() {
 		runGet(ctx, c, args[1:])
 	case "set":
 		runSet(ctx, c, args[1:])
+	case "delete":
+		runDelete(ctx, c, args[1:])
 	case "create":
 		runCreate(ctx, c, args[1:])
 	case "query":
@@ -311,28 +314,38 @@ func followGet(ctx context.Context, c *client, label, expression string) {
 	}
 }
 
+// runSet applies the same --value/--first-child/--next-sibling edit to
+// every expression given, as one atomic multi-edit Set request (see
+// node.asn's SetEdit docs). --value matches wire.Set's own regex-based,
+// zero-or-more-node semantics: it's applied to every node each expression
+// matches, not just a single one. --first-child/--next-sibling remain
+// structural, single-node operations -- each expression used with either
+// must resolve to exactly one node, or the whole Set is rejected.
 func runSet(ctx context.Context, c *client, args []string) {
 	fs := flag.NewFlagSet("set", flag.ExitOnError)
-	value := fs.String("value", "", "new string value")
-	firstChild := fs.String("first-child", "", "new firstChild: an expression, or 'none'")
-	nextSibling := fs.String("next-sibling", "", "new nextSibling: an expression, or 'none'")
+	value := fs.String("value", "", "new string value, applied to every node each expression matches")
+	firstChild := fs.String("first-child", "", "new firstChild: an expression, or 'none' (each expression must match exactly 1 node)")
+	nextSibling := fs.String("next-sibling", "", "new nextSibling: an expression, or 'none' (each expression must match exactly 1 node)")
 	fs.Parse(args)
-	if fs.NArg() != 1 {
-		fmt.Fprintln(os.Stderr, "usage: set <expression> [--value V] [--first-child EXPR|none] [--next-sibling EXPR|none]")
+	if fs.NArg() < 1 {
+		fmt.Fprintln(os.Stderr, "usage: set [--value V] [--first-child EXPR|none] [--next-sibling EXPR|none] <expression> [expression...]")
 		os.Exit(2)
 	}
-	target := fs.Arg(0)
 
-	s := &wire.Set{Target: wire.AbsolutePointer(target)}
-	if *value != "" {
-		v := wire.StringValue(*value)
-		s.NewValue = &v
-	}
-	if *firstChild != "" {
-		s.NewFirstChild = parsePointerFlag(*firstChild)
-	}
-	if *nextSibling != "" {
-		s.NewNextSibling = parsePointerFlag(*nextSibling)
+	s := &wire.Set{}
+	for _, expr := range fs.Args() {
+		edit := wire.SetEdit{Target: expr}
+		if *value != "" {
+			v := wire.StringValue(*value)
+			edit.NewValue = &v
+		}
+		if *firstChild != "" {
+			edit.NewFirstChild = parsePointerFlag(*firstChild)
+		}
+		if *nextSibling != "" {
+			edit.NewNextSibling = parsePointerFlag(*nextSibling)
+		}
+		s.Edits = append(s.Edits, edit)
 	}
 
 	seq := c.allocSeq()
@@ -342,6 +355,27 @@ func runSet(ctx context.Context, c *client, args []string) {
 		log.Fatalf("set: %v", err)
 	}
 	printResponse("set", resp)
+}
+
+// runDelete deletes every node matched by any expression given, in one
+// Delete request -- the server computes whatever parent/sibling relink is
+// needed itself (see node.asn's Delete docs).
+func runDelete(ctx context.Context, c *client, args []string) {
+	fs := flag.NewFlagSet("delete", flag.ExitOnError)
+	fs.Parse(args)
+	if fs.NArg() < 1 {
+		fmt.Fprintln(os.Stderr, "usage: delete <expression> [expression...]")
+		os.Exit(2)
+	}
+
+	d := &wire.Delete{Targets: fs.Args()}
+	seq := c.allocSeq()
+	d.SequenceNumber = seq
+	resp, err := c.sendAndWait(ctx, seq, wire.Message{Kind: wire.MsgDelete, Delete: d})
+	if err != nil {
+		log.Fatalf("delete: %v", err)
+	}
+	printResponse("delete", resp)
 }
 
 func parsePointerFlag(s string) *wire.NodePointer {

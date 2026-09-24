@@ -1,9 +1,9 @@
 # NodeTree over QUIC (Go)
 
 A Go implementation of the NodeTree protocol defined in
-[`../node.asn`](../node.asn): `Get`, `Set`, `Create`, `Query`, typed
-`NodeValue`s, and a reliable-but-**unordered** delivery layer built on
-QUIC's unreliable DATAGRAM extension ([RFC 9221](https://www.rfc-editor.org/rfc/rfc9221.html)).
+[`../node.asn`](../node.asn): `Get`, `Set`, `Delete`, `Create`, `Query`,
+typed `NodeValue`s, and a reliable-but-**unordered** delivery layer built
+on QUIC's unreliable DATAGRAM extension ([RFC 9221](https://www.rfc-editor.org/rfc/rfc9221.html)).
 
 ## Why QUIC datagrams instead of streams
 
@@ -31,7 +31,7 @@ Noise-based crypto).
 | Package | Purpose |
 |---|---|
 | `internal/wire` | Hand-written BER codec for every node.asn message type, verified against real `asn1tools`-encoded fixtures (`testdata_fixtures.json`) -- not `encoding/asn1` struct tags, which don't cleanly express this schema's mix of IMPLICIT/EXPLICIT-on-CHOICE tagging (see the package doc comment for why) |
-| `internal/tree` | The in-memory Node tree, match-expression parser/evaluator, flattening, `Set`'s delete-by-relink semantics (a port of the design proven out in the (now-removed) Python prototype's `common.py`), and a change-notification primitive (`ChangedSince`) `Query`'s `onChange` mode blocks on |
+| `internal/tree` | The in-memory Node tree, match-expression parser/evaluator, flattening (a port of the design proven out in the (now-removed) Python prototype's `common.py`), `Set`'s atomic multi-edit application (with rollback on a conflicting structural edit), `Delete`'s own relink-around-the-gap logic, and a change-notification primitive (`ChangedSince`) `Query`'s `onChange` mode blocks on |
 | `internal/reliability` | `SummaryAck`-based ack/retransmit over QUIC datagrams |
 | `internal/query` | `Query`'s collect/aggregate/transfer pipeline (interval-polled or event-driven `onChange`) and aggregation math (min/max/mean/stdDev/percentile) |
 | `internal/server` | Session management (one per QUIC connection), message dispatch, error-node generation |
@@ -52,8 +52,18 @@ go run ./cmd/client get "/users/user=alice"
 go run ./cmd/client set --value superadmin "/users/group=admin"
 go run ./cmd/client create note "hello world"
 
-# delete /config/retries by relinking timeout's nextSibling to none
-go run ./cmd/client set --next-sibling none "/config/timeout"
+# Set's target is a regex match expression, like Get's -- it can match (and
+# update) more than one node in a single edit...
+go run ./cmd/client set --value down "/interfaces/ifAdminStatus"
+
+# ...and a single Set request can carry several distinct expressions,
+# applied atomically (all of them, or none):
+go run ./cmd/client set --value 60 "/config/timeout" "/config/retries"
+
+# Delete: the server figures out the parent/sibling relink itself, so the
+# client only needs to address the node it wants gone -- no more manual
+# "set --next-sibling none" dance. Also regex-based and multi-target.
+go run ./cmd/client delete "/config/retries"
 
 # a query that runs once and returns immediately
 go run ./cmd/client query --collection 0 --transfer 0 "/config/timeout"
@@ -174,13 +184,19 @@ I/O.
   conversation's mTLS design discussion (TCP+TLS vs. DTLS vs. QUIC's own
   TLS 1.3 handshake, optionally with RFC 7250 raw public keys for a
   Noise-like lightweight trust model) for what a real deployment needs.
-- **`Set`'s addressing gap**, documented in `internal/tree/tree_test.go`'s
-  `TestSetDeleteFirstChildByRelink`: the demo tree's three `users` records
-  are only distinguishable by their *children's* values, not their own
-  key/value, so there's currently no expression that addresses "the
-  `users` node containing `user=alice`" directly for a targeted delete.
-  The delete-by-relink primitive itself is correct and tested; reaching
-  the right parent node from a client is a query-language gap.
+- **No "delete by descendant" addressing**, documented in
+  `internal/tree/tree_test.go`'s `TestSetDeleteFirstChildByRelink` and
+  `TestDeleteAddressesTheNodeItself`: `Delete` closes the *mechanical*
+  addressing gap this used to describe (a client no longer computes any
+  relink itself -- see `Delete`, below), but not a deeper one. The demo
+  tree's three `users` records are only distinguishable by their
+  *children's* values, not their own key/value, so `delete
+  "/users/user=alice"` removes just alice's `user` leaf, not the `users`
+  container that holds it alongside her `group` node -- there's still no
+  expression that addresses "the `users` node containing `user=alice`"
+  itself. Closing that needs a genuinely richer query language
+  (ancestor-of-a-matching-descendant predicates), not more server-side
+  bookkeeping.
 - **Fixed-interval retransmission**, not TCP-style adaptive RTO -- a
   reasonable simplification for a reference implementation, not a
   production congestion/loss-recovery strategy.
@@ -191,10 +207,10 @@ I/O.
   (it rotates on path migration), so a server-generated id fills the same
   role more robustly.
 - **`onChange` doesn't report deletions.** If a matched node stops
-  existing (e.g. deleted via `Set`'s relink-around convention), its last
-  known value simply stops updating -- there's no tombstone/removal
-  concept in `QueryResults`, only additions. Closing this needs a
-  deletion marker in the wire schema, not just server logic.
+  existing (e.g. via `Delete`), its last known value simply stops
+  updating -- there's no tombstone/removal concept in `QueryResults`,
+  only additions. Closing this needs a deletion marker in the wire
+  schema, not just server logic.
 - **No per-subscription cancel.** A session can have several concurrent
   `Query`s running (`Session.activeQueries`), but there's no message to
   stop just one -- the only way to stop any of them today is to close the

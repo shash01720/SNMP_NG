@@ -134,12 +134,26 @@ type Get struct {
 	Target         NodePointer
 }
 
-type Set struct {
-	SequenceNumber int64
-	Target         NodePointer
+// SetEdit is one target-expression + field-update within a Set request.
+// Target is a match expression (the same regex-based grammar as an
+// absolute NodePointer, not a NodePointer itself) that may match zero or
+// more nodes; see node.asn's SetEdit docs for exactly how each field
+// behaves against that match set.
+type SetEdit struct {
+	Target         string
 	NewValue       *NodeValue   // nil = omitted (OPTIONAL, "leave unchanged")
 	NewFirstChild  *NodePointer // nil = omitted; a present NonePointer() explicitly clears it
 	NewNextSibling *NodePointer
+}
+
+type Set struct {
+	SequenceNumber int64
+	Edits          []SetEdit
+}
+
+type Delete struct {
+	SequenceNumber int64
+	Targets        []string
 }
 
 type Create struct {
@@ -217,6 +231,7 @@ const (
 	MsgQuery
 	MsgResponse
 	MsgSummaryAck
+	MsgDelete
 )
 
 // Message is the outer envelope actually carried in each QUIC DATAGRAM
@@ -229,4 +244,5 @@ type Message struct {
 	Query      *Query
 	Response   *Response
 	SummaryAck *SummaryAck
+	Delete     *Delete
 }

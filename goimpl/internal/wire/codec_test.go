@@ -99,11 +99,28 @@ func TestSetFixture(t *testing.T) {
 	newFirstChild := NonePointer()
 	s := &Set{
 		SequenceNumber: 2,
-		Target:         AbsolutePointer("/users/user=alice"),
-		NewValue:       &newValue,
-		NewFirstChild:  &newFirstChild,
+		Edits: []SetEdit{
+			{Target: "/users/user=alice", NewValue: &newValue, NewFirstChild: &newFirstChild},
+		},
 	}
 	checkFixture(t, fixtures, "Set_1", MarshalSet(s), UnmarshalSet, s)
+
+	v1 := Integer32Value(2)
+	v2 := StringValue("60")
+	multi := &Set{
+		SequenceNumber: 10,
+		Edits: []SetEdit{
+			{Target: "/interfaces/ifAdminStatus", NewValue: &v1},
+			{Target: "/config/timeout", NewValue: &v2},
+		},
+	}
+	checkFixture(t, fixtures, "Set_multi", MarshalSet(multi), UnmarshalSet, multi)
+}
+
+func TestDeleteFixture(t *testing.T) {
+	fixtures := loadFixtures(t)
+	d := &Delete{SequenceNumber: 11, Targets: []string{"/users/user=alice", "/config/retries"}}
+	checkFixture(t, fixtures, "Delete_1", MarshalDelete(d), UnmarshalDelete, d)
 }
 
 func TestCreateFixtures(t *testing.T) {
@@ -172,6 +189,9 @@ func TestNodeTreeMessageFixtures(t *testing.T) {
 
 	ackMsg := Message{Kind: MsgSummaryAck, SummaryAck: &SummaryAck{Received: []SequenceRange{{First: 0, Last: 3}}}}
 	checkFixture(t, fixtures, "NodeTreeMessage_summaryAck", MarshalMessage(ackMsg), UnmarshalMessage, ackMsg)
+
+	deleteMsg := Message{Kind: MsgDelete, Delete: &Delete{SequenceNumber: 12, Targets: []string{"/config/retries"}}}
+	checkFixture(t, fixtures, "NodeTreeMessage_delete", MarshalMessage(deleteMsg), UnmarshalMessage, deleteMsg)
 }
 
 // TestRoundTripAllKinds is a broader internal-consistency sweep beyond the

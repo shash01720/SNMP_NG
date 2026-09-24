@@ -100,26 +100,55 @@ Get ::= SEQUENCE {
     target          NodePointer
 }
 
--- Updates an existing node, identified by `target` (which must resolve
--- to exactly one node; zero or multiple matches is an error). Each of
--- newValue/newFirstChild/newNextSibling is independently optional:
--- omitted means "leave this field unchanged". A field can be
--- explicitly cleared by supplying a pointer whose value is `none`
--- (NodePointer's none arm) for newFirstChild/newNextSibling.
+-- One target-expression plus field-update within a Set request.
+-- `target` uses the same match-expression grammar as an absolute
+-- NodePointer (regex-based key/value segments; see NodePointer, above)
+-- and may match zero or more nodes.
 --
--- Deletion is not a separate message: to delete a node, Set the
--- pointer that reaches it, either the parent's firstChild (if it's the
--- first child) or the preceding sibling's nextSibling (otherwise), to
--- whatever the deleted node's OWN firstChild/nextSibling was pointing
--- to (or `none`, if it had none), so the list closes back up around
--- the gap.
+-- newValue is applied to every node `target` matches (a no-op if it
+-- matches none). newFirstChild/newNextSibling are structural,
+-- single-node operations: `target` MUST resolve to exactly one node
+-- when either is present (an error otherwise), since relinking a
+-- shared pointer across multiple nodes isn't a well-defined tree
+-- operation. Each of the three fields is independently optional:
+-- omitted means "leave this field unchanged". A pointer field can be
+-- explicitly cleared by supplying `none` (NodePointer's none arm).
 
-Set ::= SEQUENCE {
-    sequenceNumber  INTEGER,
-    target          NodePointer,
+SetEdit ::= SEQUENCE {
+    target          UTF8String,
     newValue        NodeValue OPTIONAL,
     newFirstChild   NodePointer OPTIONAL,
     newNextSibling  NodePointer OPTIONAL
+}
+
+-- Applies every edit in `edits`, atomically: every target is resolved
+-- against the SAME pre-request tree state (so an earlier edit in the
+-- list never changes what a later edit's target matches), and if any
+-- edit fails validation, a bad expression or a structural edit whose
+-- target doesn't resolve to exactly one node, none of the edits in the
+-- request are applied.
+--
+-- To delete a node, use Delete, below: newFirstChild/newNextSibling
+-- remain available here for other structural edits (e.g. reordering
+-- children), but the server now computes deletion's own relinking
+-- itself, so a client no longer needs to.
+
+Set ::= SEQUENCE {
+    sequenceNumber  INTEGER,
+    edits           SEQUENCE OF SetEdit
+}
+
+-- Deletes every node matched by any expression in `targets` (same
+-- match-expression grammar as SetEdit.target/Get). For each deleted
+-- node the server itself removes it from its parent's child list; the
+-- client only needs to address the node it wants gone, not compute
+-- which sibling/parent pointer to relink around it. The tree root
+-- cannot be deleted (a target resolving to it is an error). Like Set,
+-- every target is resolved against the same pre-request tree state.
+
+Delete ::= SEQUENCE {
+    sequenceNumber  INTEGER,
+    targets         SEQUENCE OF UTF8String
 }
 
 -- Creates a new node under this session's own
@@ -259,7 +288,8 @@ NodeTreeMessage ::= CHOICE {
     create      [2] Create,
     query       [3] Query,
     response    [4] Response,
-    summaryAck  [5] SummaryAck
+    summaryAck  [5] SummaryAck,
+    delete      [6] Delete
 }
 
 -- ===========================================================================

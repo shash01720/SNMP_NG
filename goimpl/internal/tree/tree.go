@@ -469,53 +469,201 @@ func (t *Tree) AppendUnder(parent *Node, key string, value wire.NodeValue) *Node
 	return n
 }
 
-// Set applies a Set request to the tree: target must resolve to exactly one
-// node; each of newValue/newFirstChild/newNextSibling is applied if
-// non-nil. newFirstChild/newNextSibling name a target node by absolute
-// expression (resolved the same way Set.target is) or clear the pointer
-// (wire.NonePointer()) -- an offset pointer is invalid input from a client
-// and rejected, since offsets are only meaningful inside a server-generated
-// flattened Response.
-func (t *Tree) Set(s *wire.Set) error {
-	if err := t.setLocked(s); err != nil {
-		return err
-	}
-	t.notifyChanged()
-	return nil
+// setEditPlan is one edit fully resolved against the tree as it stood
+// before any edit in this Set request was applied -- see Set's doc comment
+// for why resolving everything up front, before mutating anything, is what
+// makes the whole request atomic.
+type setEditPlan struct {
+	edit        wire.SetEdit
+	targets     []*Node // newValue's target(s) (0+); structural edits' single target (exactly 1, checked during planning)
+	firstChild  *Node   // pre-resolved edit.NewFirstChild target; meaningful only if edit.NewFirstChild != nil (nil there means "clear")
+	nextSibling *Node   // pre-resolved edit.NewNextSibling target; meaningful only if edit.NewNextSibling != nil
 }
 
-func (t *Tree) setLocked(s *wire.Set) error {
+// Set applies every edit in s.Edits atomically. Each edit's target is a
+// match expression (like Get's, not a NodePointer) which may match zero or
+// more nodes for a value-only edit; newValue is applied to every match (a
+// no-op if there are none, the same "empty match isn't an error" idempotent
+// stance Get and Delete take). newFirstChild/newNextSibling are structural
+// operations and require target to resolve to exactly one node.
+//
+// Every edit's target -- and, for structural edits, its newFirstChild/
+// newNextSibling pointer target -- is resolved against the tree as it
+// stood when Set was called, before any edit in this request is applied,
+// so earlier edits never change what a later edit's target matches. If any
+// edit fails to resolve, no mutation happens at all. If a later edit's
+// planned relink turns out to conflict with an earlier edit's already-
+// applied one (both touching the same parent's child list -- possible only
+// between two structural edits in the same request), every mutation
+// already applied in this call is rolled back and the conflict is reported
+// as an error: the request is genuinely all-or-nothing, not best-effort.
+//
+// Returns every node actually written to (deduplicated, first-touched
+// order) for the caller to report back to the client.
+func (t *Tree) Set(s *wire.Set) ([]*Node, error) {
 	t.mu.Lock()
-	defer t.mu.Unlock()
 
-	target, err := t.resolveOneLocked(s.Target)
+	var plans []setEditPlan
+	for _, edit := range s.Edits {
+		segments, err := ParseExpression(edit.Target)
+		if err != nil {
+			t.mu.Unlock()
+			return nil, fmt.Errorf("target %q: %w", edit.Target, err)
+		}
+		targets := Evaluate(t.Root, segments)
+		structural := edit.NewFirstChild != nil || edit.NewNextSibling != nil
+		if structural && len(targets) != 1 {
+			t.mu.Unlock()
+			return nil, fmt.Errorf("target %q: newFirstChild/newNextSibling require exactly 1 match, got %d", edit.Target, len(targets))
+		}
+		plan := setEditPlan{edit: edit, targets: targets}
+		if edit.NewFirstChild != nil {
+			n, err := t.resolvePointerAsChildLocked(*edit.NewFirstChild)
+			if err != nil {
+				t.mu.Unlock()
+				return nil, fmt.Errorf("target %q: newFirstChild: %w", edit.Target, err)
+			}
+			plan.firstChild = n
+		}
+		if edit.NewNextSibling != nil {
+			n, err := t.resolvePointerAsChildLocked(*edit.NewNextSibling)
+			if err != nil {
+				t.mu.Unlock()
+				return nil, fmt.Errorf("target %q: newNextSibling: %w", edit.Target, err)
+			}
+			plan.nextSibling = n
+		}
+		plans = append(plans, plan)
+	}
+
+	touched, err := applySetPlans(plans)
+	t.mu.Unlock()
 	if err != nil {
-		return fmt.Errorf("target: %w", err)
+		return nil, err
+	}
+	if len(touched) > 0 {
+		t.notifyChanged()
+	}
+	return touched, nil
+}
+
+// applySetPlans mutates the tree per plans, rolling back every change made
+// in this call if any structural relink fails partway through (see Set's
+// doc comment). Caller must hold t.mu.
+func applySetPlans(plans []setEditPlan) (touched []*Node, err error) {
+	type valueUndo struct {
+		node *Node
+		old  wire.NodeValue
+	}
+	var valueUndos []valueUndo
+	childrenUndos := map[*Node][]*Node{}
+	snapshotChildren := func(n *Node) {
+		if _, done := childrenUndos[n]; done {
+			return
+		}
+		old := make([]*Node, len(n.Children))
+		copy(old, n.Children)
+		childrenUndos[n] = old
+	}
+	rollback := func() {
+		for _, u := range valueUndos {
+			u.node.Value = u.old
+		}
+		for n, old := range childrenUndos {
+			n.Children = old
+		}
 	}
 
-	if s.NewValue != nil {
-		target.Value = *s.NewValue
+	seen := map[*Node]bool{}
+	addTouched := func(n *Node) {
+		if !seen[n] {
+			seen[n] = true
+			touched = append(touched, n)
+		}
 	}
 
-	if s.NewFirstChild != nil {
-		newChild, err := t.resolvePointerAsChildLocked(*s.NewFirstChild)
-		if err != nil {
-			return fmt.Errorf("newFirstChild: %w", err)
+	for _, p := range plans {
+		if p.edit.NewValue != nil {
+			for _, n := range p.targets {
+				valueUndos = append(valueUndos, valueUndo{node: n, old: n.Value})
+				n.Value = *p.edit.NewValue
+				addTouched(n)
+			}
 		}
-		if err := relinkFirstChild(target, newChild); err != nil {
-			return fmt.Errorf("newFirstChild: %w", err)
+		if p.edit.NewFirstChild != nil {
+			target := p.targets[0]
+			snapshotChildren(target)
+			if err := relinkFirstChild(target, p.firstChild); err != nil {
+				rollback()
+				return nil, fmt.Errorf("target %q: newFirstChild: %w", p.edit.Target, err)
+			}
+			addTouched(target)
+		}
+		if p.edit.NewNextSibling != nil {
+			target := p.targets[0]
+			if target.Parent != nil {
+				snapshotChildren(target.Parent)
+			}
+			if err := relinkNextSibling(target, p.nextSibling); err != nil {
+				rollback()
+				return nil, fmt.Errorf("target %q: newNextSibling: %w", p.edit.Target, err)
+			}
+			addTouched(target)
 		}
 	}
-	if s.NewNextSibling != nil {
-		newSibling, err := t.resolvePointerAsChildLocked(*s.NewNextSibling)
+	return touched, nil
+}
+
+// Delete removes every node matched by any expression in targets from its
+// parent's child list, computing whatever relink is needed itself -- the
+// caller only needs to address the node it wants gone, not compute which
+// sibling/parent pointer to relink around it (see node.asn's Delete docs).
+// Every target is evaluated against the tree as it stood when Delete was
+// called, exactly like Set. A target matching zero nodes is not an error
+// (the same idempotent-delete stance a retried at-least-once request
+// needs: deleting an already-gone node must not start failing).
+//
+// The tree root can never be a match -- Evaluate only ever matches a
+// node's children, never the node it's handed, so there's no expression
+// that resolves to the root itself.
+//
+// Returns every node actually deleted (its state just before removal,
+// deduplicated, first-matched order) for the caller to report back to the
+// client.
+func (t *Tree) Delete(targets []string) ([]*Node, error) {
+	t.mu.Lock()
+
+	var matched []*Node
+	seen := map[*Node]bool{}
+	for _, expr := range targets {
+		segments, err := ParseExpression(expr)
 		if err != nil {
-			return fmt.Errorf("newNextSibling: %w", err)
+			t.mu.Unlock()
+			return nil, fmt.Errorf("target %q: %w", expr, err)
 		}
-		if err := relinkNextSibling(target, newSibling); err != nil {
-			return fmt.Errorf("newNextSibling: %w", err)
+		for _, n := range Evaluate(t.Root, segments) {
+			if !seen[n] {
+				seen[n] = true
+				matched = append(matched, n)
+			}
 		}
 	}
-	return nil
+	for _, n := range matched {
+		removeChild(n.Parent, n)
+	}
+	t.mu.Unlock()
+
+	if len(matched) > 0 {
+		t.notifyChanged()
+	}
+	return matched, nil
+}
+
+// removeChild removes child from parent's Children slice. child must
+// currently be one of parent's children.
+func removeChild(parent, child *Node) {
+	idx := indexOfChild(parent, child)
+	parent.Children = append(parent.Children[:idx], parent.Children[idx+1:]...)
 }
 
 func (t *Tree) resolveOneLocked(p wire.NodePointer) (*Node, error) {
@@ -551,6 +699,16 @@ func relinkFirstChild(parent, newFirstChild *Node) error {
 		return fmt.Errorf("%q is not a child of the target node", newFirstChild.Key)
 	}
 	idx := indexOfChild(parent, newFirstChild)
+	if idx < 0 {
+		// newFirstChild.Parent still says parent (that field is never
+		// updated when a node is spliced out of Children -- see
+		// removeChild/relinkNextSibling), but it's no longer actually
+		// among parent's children. Only reachable from a multi-edit Set
+		// where an earlier edit in the same request already removed it;
+		// a single edit resolved fresh against the live tree can't hit
+		// this.
+		return fmt.Errorf("%q is no longer among the target node's children (removed by an earlier edit in this request)", newFirstChild.Key)
+	}
 	parent.Children = parent.Children[idx:]
 	return nil
 }
@@ -561,6 +719,9 @@ func relinkNextSibling(node, newNextSibling *Node) error {
 		return fmt.Errorf("target node has no parent (it is the root)")
 	}
 	idx := indexOfChild(parent, node)
+	if idx < 0 {
+		return fmt.Errorf("target node is no longer among its parent's children (removed by an earlier edit in this request)")
+	}
 	if newNextSibling == nil {
 		parent.Children = parent.Children[:idx+1]
 		return nil
@@ -569,6 +730,9 @@ func relinkNextSibling(node, newNextSibling *Node) error {
 		return fmt.Errorf("%q is not a sibling of the target node", newNextSibling.Key)
 	}
 	newIdx := indexOfChild(parent, newNextSibling)
+	if newIdx < 0 {
+		return fmt.Errorf("%q is no longer among the target node's siblings (removed by an earlier edit in this request)", newNextSibling.Key)
+	}
 	parent.Children = append(parent.Children[:idx+1:idx+1], parent.Children[newIdx:]...)
 	return nil
 }

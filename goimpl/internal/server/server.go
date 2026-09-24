@@ -229,6 +229,8 @@ func requestSeq(msg wire.Message) (seq int64, ok bool) {
 		return msg.Create.SequenceNumber, true
 	case wire.MsgQuery:
 		return msg.Query.SequenceNumber, true
+	case wire.MsgDelete:
+		return msg.Delete.SequenceNumber, true
 	default:
 		return 0, false
 	}
@@ -264,6 +266,8 @@ func (sess *Session) handleMessage(ctx context.Context, msg wire.Message) {
 		sess.handleQuery(ctx, msg.Query)
 	case wire.MsgSummaryAck:
 		sess.sender.HandleAck(msg.SummaryAck)
+	case wire.MsgDelete:
+		sess.handleDelete(msg.Delete)
 	}
 }
 
@@ -362,6 +366,7 @@ const (
 	errNoSuchNode        = "NoSuchNode"
 	errAmbiguousTarget   = "AmbiguousTarget"
 	errInvalidSet        = "InvalidSet"
+	errInvalidDelete     = "InvalidDelete"
 	errInvalidQuery      = "InvalidQuery"
 	errInternal          = "InternalError"
 )
@@ -409,18 +414,35 @@ func (sess *Session) handleGet(g *wire.Get) {
 // --- Set -------------------------------------------------------------------
 
 func (sess *Session) handleSet(s *wire.Set) {
-	if err := sess.server.Tree.Set(s); err != nil {
-		code := errInvalidSet
-		if s.Target.Kind == wire.PointerAbsolute {
-			// A best-effort guess at whether this was "no/ambiguous
-			// match" vs. a relink-specific failure, for a slightly more
-			// useful error code; either way the message has the details.
-			code = errNoSuchNode
-		}
-		sess.respondError(s.SequenceNumber, code, err.Error())
+	touched, err := sess.server.Tree.Set(s)
+	if err != nil {
+		// Set's edits can each fail for a different reason (bad expression,
+		// wrong match count, a relink conflict between two edits), so
+		// there's no single more-specific code worth guessing at here the
+		// way handleGet's errInvalidExpression can be -- errInvalidSet plus
+		// the message (which names the offending target) is what a caller
+		// actually needs.
+		sess.respondError(s.SequenceNumber, errInvalidSet, err.Error())
 		return
 	}
-	sess.respondAndCache(s.SequenceNumber, &wire.Response{InReplyTo: s.SequenceNumber})
+	sess.respondAndCache(s.SequenceNumber, &wire.Response{
+		InReplyTo: s.SequenceNumber,
+		Nodes:     confirmationNodes(touched),
+	})
+}
+
+// --- Delete ------------------------------------------------------------------
+
+func (sess *Session) handleDelete(d *wire.Delete) {
+	deleted, err := sess.server.Tree.Delete(d.Targets)
+	if err != nil {
+		sess.respondError(d.SequenceNumber, errInvalidDelete, err.Error())
+		return
+	}
+	sess.respondAndCache(d.SequenceNumber, &wire.Response{
+		InReplyTo: d.SequenceNumber,
+		Nodes:     confirmationNodes(deleted),
+	})
 }
 
 // --- Create ----------------------------------------------------------------
@@ -433,13 +455,26 @@ func (sess *Session) handleCreate(c *wire.Create) {
 	n := sess.server.Tree.AppendUnder(sess.newNodesPath, c.Key, value)
 	sess.respondAndCache(c.SequenceNumber, &wire.Response{
 		InReplyTo: c.SequenceNumber,
-		Nodes: []wire.Node{{
+		Nodes:     confirmationNodes([]*tree.Node{n}),
+	})
+}
+
+// confirmationNodes maps tree nodes to a flat wire.Node list reporting
+// exactly what Set/Create/Delete touched. These are independent
+// confirmation entries, not a real flattened subtree walk (see
+// tree.FlattenMatches for that), so firstChild/nextSibling are always the
+// "none" sentinel.
+func confirmationNodes(nodes []*tree.Node) []wire.Node {
+	out := make([]wire.Node, len(nodes))
+	for i, n := range nodes {
+		out[i] = wire.Node{
 			Key:         n.Key,
 			Value:       n.Value,
 			FirstChild:  wire.OffsetPointer(0),
 			NextSibling: wire.OffsetPointer(0),
-		}},
-	})
+		}
+	}
+	return out
 }
 
 // --- Query -----------------------------------------------------------------

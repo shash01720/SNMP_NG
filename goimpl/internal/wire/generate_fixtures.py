@@ -47,11 +47,26 @@ cases = {
         "Set",
         {
             "sequenceNumber": 2,
-            "target": ("absolute", "/users/user=alice"),
-            "newValue": ("octetString", b"root"),
-            "newFirstChild": ("none", None),
+            "edits": [
+                {
+                    "target": "/users/user=alice",
+                    "newValue": ("octetString", b"root"),
+                    "newFirstChild": ("none", None),
+                }
+            ],
         },
     ),
+    "Set_multi": (
+        "Set",
+        {
+            "sequenceNumber": 10,
+            "edits": [
+                {"target": "/interfaces/ifAdminStatus", "newValue": ("integer32", 2)},
+                {"target": "/config/timeout", "newValue": ("octetString", b"60")},
+            ],
+        },
+    ),
+    "Delete_1": ("Delete", {"sequenceNumber": 11, "targets": ["/users/user=alice", "/config/retries"]}),
     "Create_1": ("Create", {"sequenceNumber": 3, "key": "note", "value": ("octetString", b"hi")}),
     "Create_2": ("Create", {"sequenceNumber": 4, "key": "container"}),
     "AggregationMethod_percentile": ("AggregationMethod", ("percentile", 95)),
@@ -99,6 +114,10 @@ cases = {
     "SummaryAck_1": ("SummaryAck", {"received": [{"first": 0, "last": 5}, {"first": 8, "last": 8}]}),
     "NodeTreeMessage_get": ("NodeTreeMessage", ("get", {"sequenceNumber": 1, "target": ("absolute", "/users")})),
     "NodeTreeMessage_summaryAck": ("NodeTreeMessage", ("summaryAck", {"received": [{"first": 0, "last": 3}]})),
+    "NodeTreeMessage_delete": (
+        "NodeTreeMessage",
+        ("delete", {"sequenceNumber": 12, "targets": ["/config/retries"]}),
+    ),
 }
 
 out = {}
