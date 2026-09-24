@@ -270,13 +270,15 @@ func runGet(ctx context.Context, c *client, args []string) {
 // until no continuations remain, so the caller always sees the complete,
 // correctly-linked result regardless of how many datagrams it took.
 func followGet(ctx context.Context, c *client, label, expression string) {
-	seen := map[string]bool{expression: true}
-	queue := []string{expression}
+	q := newContinuationQueue()
+	q.Add(expression)
 	followups := 0
 
-	for len(queue) > 0 {
-		expr := queue[0]
-		queue = queue[1:]
+	for {
+		expr, ok := q.Next()
+		if !ok {
+			break
+		}
 
 		seq := c.allocSeq()
 		msg := wire.Message{Kind: wire.MsgGet, Get: &wire.Get{SequenceNumber: seq, Target: wire.AbsolutePointer(expr)}}
@@ -284,6 +286,7 @@ func followGet(ctx context.Context, c *client, label, expression string) {
 		if err != nil {
 			log.Fatalf("get: %v", err)
 		}
+		q.MarkCovered(expr, len(resp.Nodes))
 
 		batchLabel := label
 		if expr != expression {
@@ -293,16 +296,16 @@ func followGet(ctx context.Context, c *client, label, expression string) {
 
 		for _, n := range resp.Nodes {
 			for _, p := range []wire.NodePointer{n.FirstChild, n.NextSibling} {
-				if p.Kind != wire.PointerAbsolute || seen[p.Absolute] {
+				if p.Kind != wire.PointerAbsolute {
 					continue
 				}
 				if followups >= maxFollowups {
 					log.Printf("get: hit max-followups=%d, not following %q", maxFollowups, p.Absolute)
 					continue
 				}
-				seen[p.Absolute] = true
-				queue = append(queue, p.Absolute)
-				followups++
+				if q.Add(p.Absolute) {
+					followups++
+				}
 			}
 		}
 	}

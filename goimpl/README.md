@@ -129,6 +129,38 @@ get (continuation of "/users@1"): 1 node(s)
 ...
 ```
 
+### Continuation dedup: why fetching isn't naive FIFO
+
+A truncated batch can dangle more than one pointer at once -- e.g. the
+`/users` example above: the very first `Get` already returns a node with
+*both* `firstChild` (`->/users@1`) *and* `nextSibling` (`->/users@3`)
+pointing past the cut, simultaneously. On a wide/bushy tree this gets
+expensive fast: `/interfaces` (23 sibling records, ~19 fields each) has,
+for every truncation, one continuation resuming *mid-record* (the current
+record's own field chain) and another resuming at the *start of the next
+record* (the record's own parent's `nextSibling`, which sits earlier in
+the same window). Fetching both independently, unaware that the smaller
+one's own forward progress will eventually cover the larger one's data
+too, means massively overlapping re-fetches.
+
+Measured on the real IF-MIB data with jumbo frames (`--max-datagram-size
+8900`, standing in for a 9000-byte-MTU path): naively following every
+discovered continuation took **51 round trips** and delivered **1931**
+total nodes for a tree with only **460** unique ones -- a ~4.2x
+redundancy. `cmd/client/continuation.go`'s `continuationQueue` fixes
+this: it always fetches the *smallest* pending resume index first per
+base expression, and after each real response, records exactly which
+index range it covered (`[resumeIndex, resumeIndex+len(nodes))`) --
+skipping any other pending continuation whose index that range already
+proves was delivered. This is safe (a continuation is only skipped once
+an actual response has proven its data arrived, never on a guess) and
+took the same fetch down to **13 round trips** (matching the theoretical
+minimum, `ceil(460/~38 nodes-per-datagram)`) delivering **483** nodes --
+essentially no redundancy left. `cmd/client/continuation_test.go` unit
+tests this logic directly (including the exact `/interfaces@38` /
+`/interfaces@42` scenario that was measured), independent of any network
+I/O.
+
 ## Known gaps (honestly, not swept under the rug)
 
 - **No real mTLS.** `internal/certs` generates a throwaway self-signed
