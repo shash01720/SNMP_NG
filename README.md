@@ -1,5 +1,7 @@
 # NodeTree GET protocol
 
+[![CI](https://github.com/shash01720/SNMP_NG/actions/workflows/ci.yml/badge.svg)](https://github.com/shash01720/SNMP_NG/actions/workflows/ci.yml)
+
 A tree-structured key/value store and query/management protocol, defined
 in ASN.1 ([node.asn](node.asn)) and implemented in Go over QUIC
 ([`goimpl/`](goimpl/) — see its README for setup, usage, and design

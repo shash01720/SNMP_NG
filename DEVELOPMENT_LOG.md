@@ -168,7 +168,13 @@ rest of the work, largest gaps first.
   nothing to acknowledge, so a quiet `onChange` subscription would be dropped
   by QUIC itself. Both ends now set `MaxIdleTimeout`/`KeepAlivePeriod`
   (30s/10s), verified with a 40-second idle watch. Two per-session maps that
-  were never pruned are now bounded.
+  were never pruned are now bounded. A third, the reliability layer's record
+  of received sequence numbers, was missed at the time and caught in a later
+  review: it kept every sequence number for the life of the connection and
+  re-sorted all of them for every ack, 10 times a second. It is now a
+  contiguous high-water mark plus at most 1024 out-of-order entries; a gap
+  that outlives that many later arrivals belongs to a message its sender
+  has already given up on, so the receiver stops waiting for it.
 - **Query cancellation without a new message.** Each query gets its own
   results node under `QueryResults`, and deleting it cancels the query.
   Detection is reachability-based, so deleting an ancestor works too. The
@@ -199,6 +205,8 @@ Recorded because the way they were caught is as useful as the fixes.
 | relink helpers indexing with `-1` | designing the atomic-rollback test |
 | throwaway test helper passing the wrong sequence number, and an unescaped `=` in an expression | live runs whose output didn't match the expectation |
 | leaked `snmpd` MAC addresses | reading the raw capture before committing |
+| receiver keeping every sequence number, unbounded, despite the "state bounded" claim | a review comparing this log against the code |
+| query sampling and Set/Delete confirmations reading node values after the tree lock was released, racing a concurrent `Set` | the first end-to-end server test, run under `-race` |
 
 ## Things deliberately left open
 
