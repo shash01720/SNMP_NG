@@ -73,5 +73,5 @@ your own locally if you want to re-run the script end to end.
 
 ## License
 
-Copyright 2026 shash.srinivasa@gmail.com. Licensed under the
+Copyright 2026 Shashidhar Srinivasa. Licensed under the
 [Apache License, Version 2.0](LICENSE); see [NOTICE](NOTICE).
