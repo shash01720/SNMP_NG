@@ -1,0 +1,11 @@
+NodeTree (SNMP_NG)
+Copyright 2026 shash.srinivasa@gmail.com
+
+Licensed under the Apache License, Version 2.0; see the LICENSE file.
+
+This covers the protocol schema (node.asn), the Go reference implementation
+(goimpl/), the demo data tooling (parse_ifmib_dump.py) and the anonymized
+IF-MIB sample data (ifmib_dump.json).
+
+Third-party dependencies (for example github.com/quic-go/quic-go) are not
+part of this work and remain under their own licenses.
