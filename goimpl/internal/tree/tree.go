@@ -81,7 +81,7 @@ func AppendChild(parent, child *Node) {
 	parent.Children = append(parent.Children, child)
 }
 
-// --- match-expression parsing -
+// --- match-expression parsing ---
 //
 //	request    = expression ["@" resume-index]
 //	expression = 1*( ["/"] key-regexp ["=" value-regexp] )
