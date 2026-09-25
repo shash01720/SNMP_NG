@@ -22,54 +22,106 @@ import (
 
 // --- Receiver: tracks what's been received, produces SummaryAck -----------
 
+// maxOutOfOrder bounds how many sequence numbers a Receiver holds above its
+// contiguous high-water mark. A gap below them normally fills within a few
+// retransmit intervals; one that outlives this many later arrivals belongs to
+// a message its sender has already given up on (maxRetransmits *
+// retransmitInterval is about 2s at current settings), so the Receiver
+// stops waiting for it and moves the mark past it.
+const maxOutOfOrder = 1024
+
+// maxAckRanges caps the ranges in one SummaryAck so it always fits in a
+// single datagram. Acks are cumulative and resent every ack interval, so a
+// range left out now is reported by a later ack once the gaps below it
+// close; the only cost is a redundant retransmit in the meantime.
+const maxAckRanges = 64
+
+// Receiver records which sequence numbers have arrived. Sequence numbers
+// start at 1 (see node.asn). Memory is bounded: everything at or below
+// `contiguous` is summarized by that one number, and only arrivals above it
+// are held individually, at most maxOutOfOrder of them.
 type Receiver struct {
-	mu       sync.Mutex
-	received map[int64]bool
+	mu         sync.Mutex
+	contiguous int64          // every seq in [1, contiguous] has been received
+	above      map[int64]bool // received seqs > contiguous+1
 }
 
 func NewReceiver() *Receiver {
-	return &Receiver{received: make(map[int64]bool)}
+	return &Receiver{above: make(map[int64]bool)}
 }
 
 // MarkReceived records seq as received, returning true if this is the
 // first time it's been seen (a duplicate delivery -- possible any time an
 // ACK itself is lost and the sender retransmits something already
-// received -- returns false, so callers can skip reprocessing it).
+// received -- returns false, so callers can skip reprocessing it). A seq at
+// or below the high-water mark counts as a duplicate, including one the
+// Receiver stopped waiting for (see maxOutOfOrder).
 func (r *Receiver) MarkReceived(seq int64) (isNew bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if r.received[seq] {
+	if seq <= r.contiguous || r.above[seq] {
 		return false
 	}
-	r.received[seq] = true
+	r.above[seq] = true
+	r.advance()
+	for len(r.above) > maxOutOfOrder {
+		// Give up on the oldest gap: jump the mark to just below the lowest
+		// held seq, then absorb whatever is now contiguous.
+		r.contiguous = r.lowestAbove() - 1
+		r.advance()
+	}
 	return true
 }
 
-// BuildAck returns a SummaryAck covering every sequence number received so
-// far, as a compact list of inclusive ranges.
+// advance moves contiguous forward over any held seqs that now follow it.
+func (r *Receiver) advance() {
+	for r.above[r.contiguous+1] {
+		delete(r.above, r.contiguous+1)
+		r.contiguous++
+	}
+}
+
+func (r *Receiver) lowestAbove() int64 {
+	first := true
+	var low int64
+	for s := range r.above {
+		if first || s < low {
+			low, first = s, false
+		}
+	}
+	return low
+}
+
+// BuildAck returns a SummaryAck covering the sequence numbers received so
+// far, as a compact list of inclusive ranges, lowest first and at most
+// maxAckRanges of them.
 func (r *Receiver) BuildAck() *wire.SummaryAck {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if len(r.received) == 0 {
-		return &wire.SummaryAck{}
-	}
-	seqs := make([]int64, 0, len(r.received))
-	for s := range r.received {
-		seqs = append(seqs, s)
-	}
-	sort.Slice(seqs, func(i, j int) bool { return seqs[i] < seqs[j] })
-
 	var ranges []wire.SequenceRange
-	start, end := seqs[0], seqs[0]
-	for _, s := range seqs[1:] {
-		if s == end+1 {
-			end = s
-			continue
+	if r.contiguous > 0 {
+		ranges = append(ranges, wire.SequenceRange{First: 1, Last: r.contiguous})
+	}
+	if len(r.above) > 0 {
+		seqs := make([]int64, 0, len(r.above))
+		for s := range r.above {
+			seqs = append(seqs, s)
+		}
+		sort.Slice(seqs, func(i, j int) bool { return seqs[i] < seqs[j] })
+		start, end := seqs[0], seqs[0]
+		for _, s := range seqs[1:] {
+			if s == end+1 {
+				end = s
+				continue
+			}
+			ranges = append(ranges, wire.SequenceRange{First: start, Last: end})
+			start, end = s, s
 		}
 		ranges = append(ranges, wire.SequenceRange{First: start, Last: end})
-		start, end = s, s
 	}
-	ranges = append(ranges, wire.SequenceRange{First: start, Last: end})
+	if len(ranges) > maxAckRanges {
+		ranges = ranges[:maxAckRanges]
+	}
 	return &wire.SummaryAck{Received: ranges}
 }
 
@@ -125,13 +177,18 @@ func (s *Sender) Cancel(seq int64) {
 }
 
 // HandleAck removes every sequence number ack.Received covers from the
-// pending (retransmit) set.
+// pending (retransmit) set. Acks are cumulative, so the first range
+// usually spans the whole session so far; walking the pending set rather
+// than each range keeps the cost proportional to what is unacknowledged.
 func (s *Sender) HandleAck(ack *wire.SummaryAck) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	for _, r := range ack.Received {
-		for seq := r.First; seq <= r.Last; seq++ {
-			delete(s.pending, seq)
+	for seq := range s.pending {
+		for _, r := range ack.Received {
+			if seq >= r.First && seq <= r.Last {
+				delete(s.pending, seq)
+				break
+			}
 		}
 	}
 }

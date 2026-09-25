@@ -13,10 +13,10 @@ NodeTree DEFINITIONS AUTOMATIC TAGS ::= BEGIN
 -- implementation this schema now serves).
 --
 -- Every message that carries application data (Get, Set, Create, Query,
--- Response) carries its own `sequenceNumber`, monotonically increasing
--- per sender per QUIC connection, independent per direction
--- (client->server and server->client each have their own sequence
--- space). This is the unit SummaryAck acknowledges and retransmission
+-- Response) carries its own `sequenceNumber`, starting at 1 and
+-- monotonically increasing per sender per QUIC connection, independent
+-- per direction (client->server and server->client each have their own
+-- sequence space). This is the unit SummaryAck acknowledges and retransmission
 -- keys off of. SummaryAck itself is not sequence-numbered or itself
 -- acknowledged, the same way a bare ACK isn't ACKed in TCP/SCTP/QUIC's
 -- own loss recovery.
