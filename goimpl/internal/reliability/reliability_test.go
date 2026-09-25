@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/shashi/snmp-ng/goimpl/internal/wire"
+	"github.com/shash01720/SNMP_NG/goimpl/internal/wire"
 )
 
 func TestReceiverBuildAckRanges(t *testing.T) {

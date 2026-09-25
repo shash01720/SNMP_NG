@@ -1,6 +1,6 @@
 package main
 
-import "github.com/shashi/snmp-ng/goimpl/internal/tree"
+import "github.com/shash01720/SNMP_NG/goimpl/internal/tree"
 
 // continuationQueue tracks pending Get continuations discovered while
 // following a truncated result (see followGet in main.go), deduplicating

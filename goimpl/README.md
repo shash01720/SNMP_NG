@@ -21,10 +21,13 @@ are "ack-eliciting" (QUIC tracks whether they were acknowledged) but the
 retransmit decision is left to the application. `internal/reliability`
 implements that missing piece: a fixed-interval retransmitter plus
 `SummaryAck`, a compact range-based ack the receiver sends back
-periodically. See `node.asn`'s SummaryAck docs for the full reasoning, and
-the parent conversation's mTLS/DTLS/QUIC design discussion for how this
-compares to the alternatives considered (DTLS, TLS+TCP, hand-rolled
-Noise-based crypto).
+periodically. See `node.asn`'s SummaryAck docs for the full reasoning.
+
+Alternatives considered for the transport were DTLS over UDP, TLS over TCP,
+and hand-rolled Noise-based crypto. QUIC with the DATAGRAM extension won
+because one handshake gives encryption, congestion control and mutual
+authentication, without imposing the stream ordering this protocol doesn't
+need. See `../DEVELOPMENT_LOG.md` for the reasoning in more detail.
 
 ## Layout
 

@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/shashi/snmp-ng/goimpl/internal/wire"
+	"github.com/shash01720/SNMP_NG/goimpl/internal/wire"
 )
 
 func almostEqual(a, b float64) bool { return math.Abs(a-b) < 1e-9 }

@@ -5,8 +5,8 @@ import (
 	"encoding/json"
 	"log"
 
-	"github.com/shashi/snmp-ng/goimpl/internal/server"
-	"github.com/shashi/snmp-ng/goimpl/internal/wire"
+	"github.com/shash01720/SNMP_NG/goimpl/internal/server"
+	"github.com/shash01720/SNMP_NG/goimpl/internal/wire"
 )
 
 // ifmib_dump.json is a real snmpbulkwalk capture of IF-MIB's ifTable (RFC

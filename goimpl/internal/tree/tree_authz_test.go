@@ -4,8 +4,8 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/shashi/snmp-ng/goimpl/internal/authz"
-	"github.com/shashi/snmp-ng/goimpl/internal/wire"
+	"github.com/shash01720/SNMP_NG/goimpl/internal/authz"
+	"github.com/shash01720/SNMP_NG/goimpl/internal/wire"
 )
 
 func checkerFor(t *testing.T, policy string) authz.Checker {

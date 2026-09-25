@@ -3,7 +3,7 @@ package main
 import (
 	"testing"
 
-	"github.com/shashi/snmp-ng/goimpl/internal/tree"
+	"github.com/shash01720/SNMP_NG/goimpl/internal/tree"
 )
 
 func TestContinuationQueueBasicOrder(t *testing.T) {

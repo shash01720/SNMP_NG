@@ -15,12 +15,12 @@ import (
 
 	"github.com/quic-go/quic-go"
 
-	"github.com/shashi/snmp-ng/goimpl/internal/authz"
-	"github.com/shashi/snmp-ng/goimpl/internal/certs"
-	"github.com/shashi/snmp-ng/goimpl/internal/query"
-	"github.com/shashi/snmp-ng/goimpl/internal/reliability"
-	"github.com/shashi/snmp-ng/goimpl/internal/tree"
-	"github.com/shashi/snmp-ng/goimpl/internal/wire"
+	"github.com/shash01720/SNMP_NG/goimpl/internal/authz"
+	"github.com/shash01720/SNMP_NG/goimpl/internal/certs"
+	"github.com/shash01720/SNMP_NG/goimpl/internal/query"
+	"github.com/shash01720/SNMP_NG/goimpl/internal/reliability"
+	"github.com/shash01720/SNMP_NG/goimpl/internal/tree"
+	"github.com/shash01720/SNMP_NG/goimpl/internal/wire"
 )
 
 const (

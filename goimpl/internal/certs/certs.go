@@ -1,8 +1,10 @@
-// Package certs generates a throwaway self-signed TLS certificate for the
-// demo server. QUIC mandates TLS 1.3 (RFC 9001); this is not a production
-// certificate story (no CA, no client verification) -- see the mTLS design
-// discussion referenced in the project's README for what a real deployment
-// would need instead.
+// Package certs supplies the TLS configuration for NodeTree's QUIC
+// connections (QUIC mandates TLS 1.3, RFC 9001). pki.go is the real path:
+// a small CA and leaf-certificate toolkit plus mutual-TLS server and client
+// configs, where a client certificate's CommonName is its identity. This
+// file is the demo fallback used when no certificates are configured: a
+// throwaway self-signed server certificate and a client that skips
+// verification. It authenticates nothing.
 package certs
 
 import (
@@ -49,9 +51,8 @@ func GenerateSelfSigned() (*tls.Config, error) {
 
 // ClientConfig returns a tls.Config for the demo client. InsecureSkipVerify
 // is deliberate here -- this is a throwaway self-signed cert with no CA a
-// client could otherwise verify against; a real deployment needs real
-// certificate (or raw-public-key, per the mTLS design discussion)
-// verification instead.
+// client could otherwise verify against. Use ClientTLSConfig (pki.go) to
+// verify the server against a real CA.
 func ClientConfig() *tls.Config {
 	return &tls.Config{
 		InsecureSkipVerify: true,
