@@ -31,7 +31,7 @@ Noise-based crypto).
 | Package | Purpose |
 |---|---|
 | `internal/wire` | Hand-written BER codec for every node.asn message type, verified against real `asn1tools`-encoded fixtures (`testdata_fixtures.json`) -- not `encoding/asn1` struct tags, which don't cleanly express this schema's mix of IMPLICIT/EXPLICIT-on-CHOICE tagging (see the package doc comment for why) |
-| `internal/tree` | The in-memory Node tree, match-expression parser/evaluator, flattening (a port of the design proven out in the (now-removed) Python prototype's `common.py`), `Set`'s atomic multi-edit application (with rollback on a conflicting structural edit, including reparenting via `newParent`), `Delete`'s own relink-around-the-gap logic, `CreateStaged`'s nested-subtree-in-staging-space support, a change-notification primitive (`ChangedSince`) `Query`'s `onChange` mode blocks on, and `IsReachable` (is a node still attached to Root, used for delete-cancels-query) |
+| `internal/tree` | The in-memory Node tree, match-expression parser/evaluator, flattening, `Set`'s atomic multi-edit application (with rollback on a conflicting structural edit, including reparenting via `newParent`), `Delete`'s own relink-around-the-gap logic, `CreateStaged`'s nested-subtree-in-staging-space support, a change-notification primitive (`ChangedSince`) `Query`'s `onChange` mode blocks on, and `IsReachable` (is a node still attached to Root, used for delete-cancels-query) |
 | `internal/reliability` | `SummaryAck`-based ack/retransmit over QUIC datagrams |
 | `internal/query` | `Query`'s collect/aggregate/transfer pipeline (interval-polled or event-driven `onChange`) and aggregation math (min/max/mean/stdDev/percentile) |
 | `internal/server` | Session management (one per QUIC connection), message dispatch, error-node generation, per-query cancellation (deleting a query's own results node stops it) |
@@ -151,8 +151,7 @@ that mechanism alongside the forced demo below.
 
 ### Demoing truncation and continuations
 
-Like the earlier Python/UDP prototype this design was proven out in, a
-`Get` result that doesn't fit in one QUIC datagram is truncated, with `firstChild`/`nextSibling` pointers that
+A `Get` result that doesn't fit in one QUIC datagram is truncated, with `firstChild`/`nextSibling` pointers that
 would reach past the cut rewritten to an absolute `<expression>@<index>`
 continuation pointer (`tree.FitToSize`); `client.go`'s `followGet`
 resolves them automatically. A `Query` push that doesn't fit is handled

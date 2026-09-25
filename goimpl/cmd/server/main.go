@@ -76,10 +76,8 @@ func main() {
 	log.Printf("[server] shut down")
 }
 
-// seedDemoData populates the same demo tree shape used by the Python
-// reference implementation's demo_data.json, so the two implementations'
-// demos are easy to compare -- translated by hand here, since this Go tree
-// uses typed wire.NodeValue rather than the Python side's plain bytes.
+// seedDemoData populates a small demo tree of users and config values,
+// using typed wire.NodeValue.
 func seedDemoData(srv *server.Server) {
 	t := srv.Tree
 	for _, u := range []struct{ user, group string }{

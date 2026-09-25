@@ -8,11 +8,8 @@ NodeTree DEFINITIONS AUTOMATIC TAGS ::= BEGIN
 -- (Get / Response as a bare SEQUENCE OF Node) with a session-oriented
 -- protocol over QUIC, using QUIC's unreliable DATAGRAM extension
 -- (RFC 9221) as the substrate for an application-level reliable-but-
--- UNORDERED delivery layer (see SummaryAck below). The earlier Python
--- UDP prototype that proved out the core design (match expressions,
--- pre-order flattening, MSS truncation/continuation) implemented the
--- prior schema version and was never wire-compatible with this one; it
--- has since been removed as superseded (see goimpl/, the Go/QUIC
+-- UNORDERED delivery layer (see SummaryAck below). The earlier version
+-- was never wire-compatible with this one (see goimpl/, the Go/QUIC
 -- implementation this schema now serves).
 --
 -- Every message that carries application data (Get, Set, Create, Query,
@@ -67,8 +64,8 @@ NodePointer ::= CHOICE {
 --
 -- `real` is encoded as an OCTET STRING containing exactly 8 bytes: an
 -- IEEE 754 binary64 value, big-endian, NOT ASN.1's own REAL type.
--- BER's REAL encoding is fully supported by this project's Python/BER
--- tooling (verified), but Go's stdlib encoding/asn1 has no REAL support
+-- BER's REAL encoding is fully supported by common BER tooling
+-- (verified), but Go's stdlib encoding/asn1 has no REAL support
 -- at all, and hand-rolling BER REAL parsing in Go was judged not worth
 -- the risk for what's ultimately just "one double." A fixed 8-byte
 -- OCTET STRING is trivial and robust in both languages.
