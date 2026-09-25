@@ -15,7 +15,8 @@ applicable to that protocol.
 | Discard staged changes | ❌ | ✅ `discard-changes` | ❌ | ✅ `Delete` on the staged subtree |
 | Locking | ❌ | ✅ | ❌ | ❌ |
 | Schema / validation | MIB | YANG | YANG | ❌ loose `NodeValue` typing only |
-| Config vs. operational state, read-only enforcement | ✅ MAX-ACCESS | ✅ `config false` | ✅ | ❌ any client can `Set` or `Delete` anything |
+| Read-only enforcement | ✅ MAX-ACCESS | ✅ `config false` | ✅ | ✅ global `readOnly` paths that bind every identity, enforced on the nodes actually touched |
+| Config vs. operational state as a schema concept | ✅ | ✅ | ✅ | ⚠️ by policy path patterns only; there is no schema saying which nodes are state |
 | Capability negotiation | ❌ | ✅ `hello` | ✅ `Capabilities` | ❌ |
 | Interval telemetry | polling | RFC 8640 | ✅ SAMPLE | ✅ `Query`, `interval` mode |
 | Event-driven telemetry | ❌ | ✅ | ✅ ON_CHANGE | ✅ `Query`, `onChange` mode (baseline push, then diffed pushes) |
@@ -25,20 +26,21 @@ applicable to that protocol.
 | Async unsolicited notifications | ✅ TRAP/INFORM | ✅ | via ON_CHANGE | ❌ everything is triggered by a client's own standing request |
 | Reliability | ❌ (UDP) | ✅ (TCP) | ✅ | ✅ `SummaryAck` (fixed-interval retransmit, not adaptive) |
 | Long-lived connections | n/a | ✅ | ✅ | ✅ keep-alives set; per-session state bounded |
-| AAA / per-user authorization | USM + VACM | SSH + NACM | mTLS / tokens | ❌ no real mTLS, no identity |
+| Authentication | USM | SSH / TLS | mTLS / tokens | ✅ mutual TLS; the client certificate's CommonName is the identity |
+| Per-identity authorization | VACM | NACM | interceptor-level | ✅ per-identity read/write/delete path rules, deny by default; unreadable nodes are absent, not "forbidden"; sessions isolated from each other |
+| Revocation, policy reload, audit trail | varies | varies | varies | ❌ no CRL/OCSP, policy loaded once at startup, no audit log |
 | Server-side aggregation | ❌ | ❌ | ❌ | ✅ min/max/mean/stdDev/percentile in `Query` |
 | Value types | full SMI | YANG | typed | ⚠️ SNMP-inspired subset; no IpAddress, OID or Opaque; no counter-wrap-aware rates |
 
 ## Remaining gaps, in priority order
 
-1. **AAA and read-only enforcement, together.** Identity (mTLS) only matters
-   once something can say what an identity may touch. Today nothing is
-   protected.
-2. **Async notifications.** The biggest functional hole shared by all three
+1. **Async notifications.** The biggest functional hole shared by all three
    reference protocols: nothing is server-initiated independent of a
    client's own standing request.
-3. **Timestamps and a sync marker on pushes.** Cheap to add, and a telemetry
+2. **Timestamps and a sync marker on pushes.** Cheap to add, and a telemetry
    consumer needs both.
-4. **Deletion reporting in `onChange`, and staged edits to existing values.**
+3. **Deletion reporting in `onChange`, and staged edits to existing values.**
+4. **Operating access control for real:** revocation, policy reload, an audit
+   trail, and making authenticated mode the default rather than open mode.
 5. **Replace, locking, schema validation, capability negotiation.** Larger
    lifts, lower urgency.

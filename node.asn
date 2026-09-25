@@ -346,8 +346,11 @@ NodeTreeMessage ::= CHOICE {
 --     .../QueryResults/Query-SequenceNumber=<query's own sequenceNumber>
 --
 -- Deleting that node (an ordinary Delete targeting it, or a broader
--- Delete/Set that detaches it or an ancestor of it, e.g. QueryResults
--- itself) cancels the query: the server stops its collect/aggregate/
+-- Delete/Set that detaches it or an ancestor of it) cancels the query;
+-- a Delete matching every one of them at once, such as
+-- ".../QueryResults/.*", cancels all of the session's queries. (The
+-- QueryResults container itself cannot be deleted, see ACCESS CONTROL,
+-- below.) Cancelling: the server stops its collect/aggregate/
 -- transfer goroutine, same as if the session had disconnected. This is
 -- per-query cancellation without a dedicated message: a client that
 -- wants to stop watching something was already going to want its
@@ -355,5 +358,62 @@ NodeTreeMessage ::= CHOICE {
 -- means "make this go away." A completed ONCE query has no goroutine
 -- left to cancel; deleting its results node after the fact is just
 -- ordinary cleanup.
+
+-- ===========================================================================
+-- ACCESS CONTROL (convention, not a wire type)
+-- ===========================================================================
+--
+-- Identity. The QUIC/TLS handshake authenticates the peer. A server that
+-- requires client certificates (mutual TLS) takes the CommonName of the
+-- client's verified certificate as its identity; a server that doesn't
+-- treats every client as "anonymous". Identity is fixed for the life of
+-- the connection.
+--
+-- Authorization. Every node a request touches is checked, not the request
+-- text: expressions are regexes, so what they match is only known against
+-- the tree. A node's path is "/" followed by its keys from the root
+-- joined by "/", and an operation is one of:
+--
+--     read    the node may be seen, and matched by a value predicate
+--     write   its value may change, its children may be relinked, or a
+--             staged subtree may be attached beneath it (newParent)
+--     delete  it may be removed, or dropped by a relink
+--
+-- What each message needs:
+--
+--     Get, Query   read. Nodes the identity may not read are simply absent
+--                  from results, at every depth. A value predicate is only
+--                  ever tested against a readable node, so it cannot be
+--                  used to probe data the identity could not read.
+--     Set          every target and pointer target is resolved only
+--                  through what the identity can read (so an unreadable
+--                  node looks exactly like a missing one), then: write on
+--                  each node whose value changes and on a structurally
+--                  edited target; write on a newParent destination; and
+--                  delete on every node a newFirstChild/newNextSibling
+--                  relink would drop, with everything beneath it.
+--     Delete       delete on each matched node and on everything beneath
+--                  it.
+--
+-- A refused request fails as a whole, with nothing applied, as a Response
+-- whose error node has the code "PermissionDenied". Nothing here changes
+-- the wire format.
+--
+-- Built-in rules for the server-managed /Sessions subtree apply to every
+-- identity and cannot be loosened by any policy: /Sessions itself is
+-- readable, so a client can find its own session; another session's
+-- subtree is invisible and untouchable; this session's own root and its
+-- NewNodes, Errors and QueryResults containers can be read but not
+-- changed or deleted (the server holds direct references to them);
+-- beneath NewNodes everything is open to the session, since it is private
+-- staging space; beneath Errors and QueryResults nodes can be read and
+-- deleted but not written, since the server owns their content, while
+-- deleting a query's results node is how it is cancelled.
+--
+-- Everything else is decided by an operator-supplied policy: per identity
+-- read, write and delete path patterns (write and delete imply read),
+-- plus a global read-only list that no identity can write or delete. With
+-- no policy the server is in open mode: anything outside /Sessions is
+-- allowed. A policy denies by default.
 
 END

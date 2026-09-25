@@ -35,7 +35,9 @@ Noise-based crypto).
 | `internal/reliability` | `SummaryAck`-based ack/retransmit over QUIC datagrams |
 | `internal/query` | `Query`'s collect/aggregate/transfer pipeline (interval-polled or event-driven `onChange`) and aggregation math (min/max/mean/stdDev/percentile) |
 | `internal/server` | Session management (one per QUIC connection), message dispatch, error-node generation, per-query cancellation (deleting a query's own results node stops it) |
-| `internal/certs` | Throwaway self-signed TLS cert for the demo (QUIC mandates TLS 1.3) -- not a real mTLS story, see below |
+| `internal/certs` | TLS setup: a small CA/leaf-certificate toolkit for mutual TLS (a client certificate's CommonName is its identity), plus the throwaway self-signed certificate used when no certificates are configured |
+| `internal/authz` | Access-control policy: per-identity read/write/delete path patterns, a global read-only list, and the built-in `/Sessions` rules (see "Authentication and access control") |
+| `cmd/pki` | Creates a CA and issues server and client certificates |
 | `cmd/server`, `cmd/client` | CLI binaries -- `cmd/server` also embeds and seeds a real IF-MIB dataset, see below |
 
 ## Running the demo
@@ -211,6 +213,69 @@ tests this logic directly (including the exact `/interfaces@38` /
 `/interfaces@42` scenario that was measured), independent of any network
 I/O.
 
+## Authentication and access control
+
+Out of the box the demo runs in **open mode**: a throwaway self-signed
+certificate, no client authentication (every client is `"anonymous"`), and
+no policy -- which is why every example above just works. The server logs a
+warning saying so. Two things are always on regardless: sessions are
+isolated from each other, and a session's own `Errors`/`QueryResults` are
+server-owned (see `node.asn`'s ACCESS CONTROL section).
+
+For real deployments, authentication is mutual TLS and authorization is a
+policy file:
+
+```bash
+go build -o pki ./cmd/pki
+./pki init-ca -out pki/ca
+./pki issue -ca pki/ca -cn nodetree-server -server -out pki       # add -hosts for other names/IPs
+./pki issue -ca pki/ca -cn admin   -out pki                       # the -cn is the identity
+./pki issue -ca pki/ca -cn monitor -out pki
+
+go run ./cmd/server -tls-cert pki/nodetree-server.pem -tls-key pki/nodetree-server-key.pem \
+    -client-ca pki/ca/ca.pem -policy policy.example.json
+go run ./cmd/client -ca pki/ca/ca.pem -cert pki/monitor.pem -key pki/monitor-key.pem get /config
+```
+
+A client with no certificate, or one from another CA, is refused at the TLS
+handshake and gets a session-less error immediately
+(`tls: certificate required` / `unknown certificate authority`). A client
+that doesn't trust the server's CA fails at dial. `pki/` and `*-key.pem`
+are git-ignored.
+
+[`policy.example.json`](policy.example.json) shows the format: per identity,
+`read` / `write` / `delete` lists of regexes matched against a node's path
+(`/` plus its keys from the root, e.g. `/config/timeout`), a global
+`readOnly` list that binds *everyone* (here, the IF-MIB counters), and `*`
+for rules that apply to every identity. Anything not allowed is denied;
+`write` and `delete` imply `read`.
+
+What makes this more than a check on the request text:
+
+- **Enforcement is on the nodes actually touched**, inside `internal/tree`
+  under the same lock as the operation -- an expression is a regex, so its
+  text says nothing about what it will match. `Set` and `Delete` are
+  all-or-nothing: one denied node fails the whole request with
+  `PermissionDenied` and nothing applied.
+- **Unreadable nodes don't exist.** They're absent from `Get`/`Query`
+  results at every depth, and a value predicate is only tested against
+  readable nodes, so `get /users/user=alice` can't be used to probe data you
+  can't read. Targets you can't read look exactly like targets that aren't
+  there.
+- **Indirect writes are checked.** A relink (`newFirstChild`/`newNextSibling`)
+  *drops* nodes, so it needs `delete` on them; a `Delete` needs `delete` on
+  the whole subtree; attaching with `newParent` needs `write` on the
+  destination.
+- **Sessions are isolated.** Another session's subtree is invisible and
+  can't be touched, so one client can't read another's query results or
+  cancel its queries.
+
+Verified live over real QUIC with real certificates: a read-only identity
+can read but is refused every `Set`/`Delete`; an admin is still refused the
+read-only counters and deletes it has no `delete` rule for; a second session
+can neither see nor cancel another's query, and the query still receives
+later changes.
+
 ## Known gaps (honestly, not swept under the rug)
 
 - **`Create`'s staging + `Set`'s `newParent` only cover PART of NETCONF's
@@ -221,11 +286,17 @@ I/O.
   later commit, so there's no way to stage a batch of edits to values
   already in the tree. Discarding a staged subtree is just a Delete on
   it; left alone, it sits under NewNodes until the session ends.
-- **No real mTLS.** `internal/certs` generates a throwaway self-signed
-  certificate, and the client sets `InsecureSkipVerify`. See the parent
-  conversation's mTLS design discussion (TCP+TLS vs. DTLS vs. QUIC's own
-  TLS 1.3 handshake, optionally with RFC 7250 raw public keys for a
-  Noise-like lightweight trust model) for what a real deployment needs.
+- **Authentication is mutual TLS with a static trust model.** There is no
+  certificate revocation (no CRL/OCSP: revoke by re-issuing the CA), the
+  policy is loaded once at startup (no reload), and there's no per-identity
+  rate limiting or audit log beyond the server's own error logging. Open mode
+  is still the default so the demos work; it logs a warning, but it is the
+  default.
+- **Access rules match on paths, so keys are the only structure.** A
+  readable node under an unreadable parent is reachable (policies grant by
+  full path), which means a client can tell that *some* unreadable node
+  along a path matched by key alone. Values are never exposed this way, only
+  key names.
 - **No "delete by descendant" addressing**, documented in
   `internal/tree/tree_test.go`'s `TestSetDeleteFirstChildByRelink` and
   `TestDeleteAddressesTheNodeItself`: `Delete` closes the *mechanical*

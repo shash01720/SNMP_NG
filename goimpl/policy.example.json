@@ -1,0 +1,15 @@
+{
+  "readOnly": [
+    "^/interfaces/(ifIndex|ifDescr|ifType|ifMtu|ifSpeed|ifPhysAddress|ifOperStatus|ifLastChange.*|ifIn.*|ifOut.*)$"
+  ],
+  "identities": {
+    "admin": {
+      "read": ["^/"],
+      "write": ["^/config", "^/users", "^/interfaces"],
+      "delete": ["^/config", "^/users"]
+    },
+    "monitor": {
+      "read": ["^/config", "^/interfaces"]
+    }
+  }
+}

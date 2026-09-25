@@ -4,14 +4,20 @@
 package tree
 
 import (
+	"errors"
 	"fmt"
 	"regexp"
 	"strconv"
 	"strings"
 	"sync"
 
+	"github.com/shashi/snmp-ng/goimpl/internal/authz"
 	"github.com/shashi/snmp-ng/goimpl/internal/wire"
 )
+
+// ErrPermissionDenied is wrapped by every error returned because an
+// authz.Checker refused an operation; test with errors.Is.
+var ErrPermissionDenied = errors.New("permission denied")
 
 // Node is a tree node with real child pointers (unlike wire.Node, which
 // only carries offset/absolute pointers for the wire).
@@ -183,15 +189,55 @@ func splitFirstUnescaped(s string, delim byte) (before string, found bool, after
 // the nodes matched by the final segment. Caller must hold at least a read
 // lock on the owning Tree.
 func Evaluate(root *Node, segments []Segment) []*Node {
+	return evaluateAs(root, segments, nil)
+}
+
+// NodePath is n's path as authz rules see it: "/" followed by the keys from
+// the root down, joined by "/" (the root itself is "/"). Uses the Parent
+// chain, so a node detached by Delete still reports its old path.
+func NodePath(n *Node) string {
+	if n.Parent == nil {
+		return "/"
+	}
+	var keys []string
+	for c := n; c.Parent != nil; c = c.Parent {
+		keys = append(keys, c.Key)
+	}
+	var b strings.Builder
+	for i := len(keys) - 1; i >= 0; i-- {
+		b.WriteByte('/')
+		b.WriteString(keys[i])
+	}
+	return b.String()
+}
+
+func canRead(auth authz.Checker, n *Node) bool {
+	return auth == nil || auth.Allowed(authz.OpRead, NodePath(n))
+}
+
+// evaluateAs is Evaluate on behalf of an identity (auth == nil: everyone
+// sees everything). Only nodes auth may read are ever returned, and -- so a
+// value predicate can't be used as an oracle against data the caller
+// couldn't read directly -- a value predicate is only ever tested against a
+// readable node. An unreadable node that matches a segment by key alone is
+// still walked THROUGH (policies grant access by full path, so a readable
+// "/config/timeout" must stay reachable even when "/config" itself isn't
+// readable), it just never appears in a result.
+func evaluateAs(root *Node, segments []Segment, auth authz.Checker) []*Node {
 	current := []*Node{root}
-	for _, seg := range segments {
+	for i, seg := range segments {
+		last := i == len(segments)-1
 		var next []*Node
 		for _, node := range current {
 			for _, child := range node.Children {
 				if !seg.KeyRe.MatchString(child.Key) {
 					continue
 				}
+				readable := canRead(auth, child)
 				if seg.ValueRe != nil {
+					if !readable {
+						continue
+					}
 					if !child.Value.Kind.IsNumeric() && child.Value.Kind != wire.ValueOctetString {
 						continue
 					}
@@ -199,12 +245,30 @@ func Evaluate(root *Node, segments []Segment) []*Node {
 						continue
 					}
 				}
+				if last && !readable {
+					continue
+				}
 				next = append(next, child)
 			}
 		}
 		current = next
 	}
 	return current
+}
+
+// pruneVisible returns a detached copy of n's subtree containing only the
+// nodes auth may read, so a match's descendants the caller can't see are
+// dropped before flattening (flattening works from Children alone).
+func pruneVisible(n *Node, auth authz.Checker) *Node {
+	c := &Node{Key: n.Key, Value: n.Value}
+	for _, child := range n.Children {
+		if canRead(auth, child) {
+			cc := pruneVisible(child, auth)
+			cc.Parent = c
+			c.Children = append(c.Children, cc)
+		}
+	}
+	return c
 }
 
 // EvaluateExactlyOne is a convenience for Set's target resolution, which
@@ -326,6 +390,13 @@ func (t *Tree) Get(expression string) ([]wire.Node, error) {
 // (e.g. one QUIC datagram) use this plus FitToSize instead of Get, which
 // always returns the complete remainder.
 func (t *Tree) GetFull(expression string) (flat []wire.Node, resumeIndex int, base string, err error) {
+	return t.GetFullAs(expression, nil)
+}
+
+// GetFullAs is GetFull on behalf of an identity: matches and their
+// descendants the identity can't read are neither returned nor testable by
+// value predicate (see evaluateAs). auth == nil sees everything.
+func (t *Tree) GetFullAs(expression string, auth authz.Checker) (flat []wire.Node, resumeIndex int, base string, err error) {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
 	base, resumeIndex = SplitResumeSuffix(expression)
@@ -333,7 +404,12 @@ func (t *Tree) GetFull(expression string) (flat []wire.Node, resumeIndex int, ba
 	if err != nil {
 		return nil, 0, "", err
 	}
-	matches := Evaluate(t.Root, segments)
+	matches := evaluateAs(t.Root, segments, auth)
+	if auth != nil {
+		for i, m := range matches {
+			matches[i] = pruneVisible(m, auth)
+		}
+	}
 	flat = FlattenMatches(matches)
 	if resumeIndex < 0 || resumeIndex > len(flat) {
 		return nil, 0, "", fmt.Errorf("resume index %d out of range for %d node(s)", resumeIndex, len(flat))
@@ -404,13 +480,18 @@ func (t *Tree) FindOne(expression string) (*Node, error) {
 // FindAll resolves `expression` to every currently-matching live tree Node
 // (for Query's sampling, which reads the same expression repeatedly).
 func (t *Tree) FindAll(expression string) ([]*Node, error) {
+	return t.FindAllAs(expression, nil)
+}
+
+// FindAllAs is FindAll on behalf of an identity: only nodes it may read.
+func (t *Tree) FindAllAs(expression string, auth authz.Checker) ([]*Node, error) {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
 	segments, err := ParseExpression(expression)
 	if err != nil {
 		return nil, err
 	}
-	return Evaluate(t.Root, segments), nil
+	return evaluateAs(t.Root, segments, auth), nil
 }
 
 // IsReachable reports whether node is still part of the live tree (Root
@@ -493,10 +574,16 @@ func (t *Tree) AppendUnder(parent *Node, key string, value wire.NodeValue) *Node
 // entirely under its own session's staged NewNodes, one Create call at a
 // time, before attaching it to live config with Set's newParent.
 func (t *Tree) CreateStaged(stagingRoot *Node, parentExpr string, key string, value wire.NodeValue) (*Node, error) {
+	return t.CreateStagedAs(stagingRoot, parentExpr, key, value, nil)
+}
+
+// CreateStagedAs is CreateStaged with parentExpr resolved through what auth
+// can see, so a parent outside the caller's view reads as "no node matched".
+func (t *Tree) CreateStagedAs(stagingRoot *Node, parentExpr string, key string, value wire.NodeValue, auth authz.Checker) (*Node, error) {
 	t.mu.Lock()
 	parent := stagingRoot
 	if parentExpr != "" {
-		n, err := t.resolveExpressionExactlyOneLocked(parentExpr)
+		n, err := t.resolveExpressionExactlyOneLocked(parentExpr, auth)
 		if err != nil {
 			t.mu.Unlock()
 			return nil, fmt.Errorf("parent %q: %w", parentExpr, err)
@@ -553,6 +640,18 @@ type setEditPlan struct {
 // Returns every node actually written to (deduplicated, first-touched
 // order) for the caller to report back to the client.
 func (t *Tree) Set(s *wire.Set, stagingRoot *Node) ([]*Node, error) {
+	return t.SetAs(s, stagingRoot, nil)
+}
+
+// SetAs is Set on behalf of an identity; auth == nil is unrestricted.
+// Targets (and pointer targets) are resolved only through what auth can
+// read; then, before anything is applied, auth must allow: write on every
+// node whose value changes, write on a structurally edited target, delete on
+// every node a relink would drop (with its whole subtree), and write on a
+// newParent destination. Any refusal fails the whole request with an error
+// wrapping ErrPermissionDenied and nothing applied -- the same
+// plan-everything-first atomicity the rest of Set has.
+func (t *Tree) SetAs(s *wire.Set, stagingRoot *Node, auth authz.Checker) ([]*Node, error) {
 	t.mu.Lock()
 
 	var plans []setEditPlan
@@ -562,36 +661,62 @@ func (t *Tree) Set(s *wire.Set, stagingRoot *Node) ([]*Node, error) {
 			t.mu.Unlock()
 			return nil, fmt.Errorf("target %q: %w", edit.Target, err)
 		}
-		targets := Evaluate(t.Root, segments)
+		targets := evaluateAs(t.Root, segments, auth)
 		structural := edit.NewFirstChild != nil || edit.NewNextSibling != nil || edit.NewParent != nil
 		if structural && len(targets) != 1 {
 			t.mu.Unlock()
 			return nil, fmt.Errorf("target %q: newFirstChild/newNextSibling/newParent require exactly 1 match, got %d", edit.Target, len(targets))
 		}
 		plan := setEditPlan{edit: edit, targets: targets}
+		if edit.NewValue != nil {
+			for _, n := range targets {
+				if err := requireOp(auth, authz.OpWrite, n); err != nil {
+					t.mu.Unlock()
+					return nil, err
+				}
+			}
+		}
+		if structural {
+			if err := requireOp(auth, authz.OpWrite, targets[0]); err != nil {
+				t.mu.Unlock()
+				return nil, err
+			}
+		}
 		if edit.NewFirstChild != nil {
-			n, err := t.resolvePointerAsChildLocked(*edit.NewFirstChild)
+			n, err := t.resolvePointerAsChildLocked(*edit.NewFirstChild, auth)
 			if err != nil {
 				t.mu.Unlock()
 				return nil, fmt.Errorf("target %q: newFirstChild: %w", edit.Target, err)
 			}
 			plan.firstChild = n
+			if err := requireDeleteAll(auth, droppedByFirstChild(targets[0], n)); err != nil {
+				t.mu.Unlock()
+				return nil, fmt.Errorf("target %q: newFirstChild: %w", edit.Target, err)
+			}
 		}
 		if edit.NewNextSibling != nil {
-			n, err := t.resolvePointerAsChildLocked(*edit.NewNextSibling)
+			n, err := t.resolvePointerAsChildLocked(*edit.NewNextSibling, auth)
 			if err != nil {
 				t.mu.Unlock()
 				return nil, fmt.Errorf("target %q: newNextSibling: %w", edit.Target, err)
 			}
 			plan.nextSibling = n
+			if err := requireDeleteAll(auth, droppedByNextSibling(targets[0], n)); err != nil {
+				t.mu.Unlock()
+				return nil, fmt.Errorf("target %q: newNextSibling: %w", edit.Target, err)
+			}
 		}
 		if edit.NewParent != nil {
 			if stagingRoot == nil || !isDescendant(stagingRoot, targets[0]) {
 				t.mu.Unlock()
 				return nil, fmt.Errorf("target %q: newParent: target is not one of this session's own staged nodes", edit.Target)
 			}
-			newParentNode, err := t.resolveExpressionExactlyOneLocked(*edit.NewParent)
+			newParentNode, err := t.resolveExpressionExactlyOneLocked(*edit.NewParent, auth)
 			if err != nil {
+				t.mu.Unlock()
+				return nil, fmt.Errorf("target %q: newParent: %w", edit.Target, err)
+			}
+			if err := requireOp(auth, authz.OpWrite, newParentNode); err != nil {
 				t.mu.Unlock()
 				return nil, fmt.Errorf("target %q: newParent: %w", edit.Target, err)
 			}
@@ -727,6 +852,15 @@ func applySetPlans(plans []setEditPlan) (touched []*Node, err error) {
 // deduplicated, first-matched order) for the caller to report back to the
 // client.
 func (t *Tree) Delete(targets []string) ([]*Node, error) {
+	return t.DeleteAs(targets, nil)
+}
+
+// DeleteAs is Delete on behalf of an identity; auth == nil is
+// unrestricted. Targets resolve only through what auth can read, and auth
+// must allow delete on every matched node AND everything beneath it (a
+// delete takes the whole subtree); otherwise nothing is removed and the
+// error wraps ErrPermissionDenied.
+func (t *Tree) DeleteAs(targets []string, auth authz.Checker) ([]*Node, error) {
 	t.mu.Lock()
 
 	var matched []*Node
@@ -737,12 +871,16 @@ func (t *Tree) Delete(targets []string) ([]*Node, error) {
 			t.mu.Unlock()
 			return nil, fmt.Errorf("target %q: %w", expr, err)
 		}
-		for _, n := range Evaluate(t.Root, segments) {
+		for _, n := range evaluateAs(t.Root, segments, auth) {
 			if !seen[n] {
 				seen[n] = true
 				matched = append(matched, n)
 			}
 		}
+	}
+	if err := requireDeleteAll(auth, matched); err != nil {
+		t.mu.Unlock()
+		return nil, err
 	}
 	for _, n := range matched {
 		removeChild(n.Parent, n)
@@ -762,19 +900,30 @@ func removeChild(parent, child *Node) {
 	parent.Children = append(parent.Children[:idx], parent.Children[idx+1:]...)
 }
 
-func (t *Tree) resolveOneLocked(p wire.NodePointer) (*Node, error) {
+func (t *Tree) resolveOneLocked(p wire.NodePointer, auth authz.Checker) (*Node, error) {
 	if p.Kind != wire.PointerAbsolute {
 		return nil, fmt.Errorf("must be an absolute expression, not an offset")
 	}
-	return t.resolveExpressionExactlyOneLocked(p.Absolute)
+	return t.resolveExpressionExactlyOneLocked(p.Absolute, auth)
 }
 
-func (t *Tree) resolveExpressionExactlyOneLocked(expr string) (*Node, error) {
+// resolveExpressionExactlyOneLocked resolves expr through what auth can see
+// (nil sees everything), so a node the caller can't read is
+// indistinguishable from one that doesn't exist.
+func (t *Tree) resolveExpressionExactlyOneLocked(expr string, auth authz.Checker) (*Node, error) {
 	segments, err := ParseExpression(expr)
 	if err != nil {
 		return nil, err
 	}
-	return EvaluateExactlyOne(t.Root, segments)
+	matches := evaluateAs(t.Root, segments, auth)
+	switch len(matches) {
+	case 0:
+		return nil, fmt.Errorf("no node matched")
+	case 1:
+		return matches[0], nil
+	default:
+		return nil, fmt.Errorf("expression matched %d nodes, expected exactly 1", len(matches))
+	}
 }
 
 // isDescendant reports whether node is a strict descendant of root (root
@@ -798,11 +947,11 @@ func isDescendantOrSelf(root, node *Node) bool {
 // across parents is out of scope for this Set message, matching the
 // "delete by relinking" use case node.asn documents, not general tree
 // surgery).
-func (t *Tree) resolvePointerAsChildLocked(p wire.NodePointer) (*Node, error) {
+func (t *Tree) resolvePointerAsChildLocked(p wire.NodePointer, auth authz.Checker) (*Node, error) {
 	if p.Kind == wire.PointerNone {
 		return nil, nil
 	}
-	return t.resolveOneLocked(p)
+	return t.resolveOneLocked(p, auth)
 }
 
 func relinkFirstChild(parent, newFirstChild *Node) error {
@@ -859,4 +1008,76 @@ func indexOfChild(parent, child *Node) int {
 		}
 	}
 	return -1
+}
+
+// --- authorization helpers ------------------------------------------------
+
+func requireOp(auth authz.Checker, op authz.Op, n *Node) error {
+	if auth == nil || auth.Allowed(op, NodePath(n)) {
+		return nil
+	}
+	return fmt.Errorf("%w: %s on %s", ErrPermissionDenied, op, NodePath(n))
+}
+
+// requireDeleteAll requires delete permission on each node in ns and on
+// every node beneath them. It deliberately doesn't name a denied descendant
+// (which the caller may not even be able to read), only the node the
+// request reached it through.
+func requireDeleteAll(auth authz.Checker, ns []*Node) error {
+	if auth == nil {
+		return nil
+	}
+	for _, n := range ns {
+		if err := requireOp(auth, authz.OpDelete, n); err != nil {
+			return err
+		}
+		if !subtreeAllows(auth, authz.OpDelete, n) {
+			return fmt.Errorf("%w: delete on %s (its subtree includes nodes you may not delete)", ErrPermissionDenied, NodePath(n))
+		}
+	}
+	return nil
+}
+
+func subtreeAllows(auth authz.Checker, op authz.Op, n *Node) bool {
+	for _, c := range n.Children {
+		if !auth.Allowed(op, NodePath(c)) || !subtreeAllows(auth, op, c) {
+			return false
+		}
+	}
+	return true
+}
+
+// droppedByFirstChild lists what relinkFirstChild(parent, newFirst) would
+// discard: every child ahead of newFirst (or all of them, for a clear).
+func droppedByFirstChild(parent, newFirst *Node) []*Node {
+	if newFirst == nil {
+		return append([]*Node(nil), parent.Children...)
+	}
+	idx := indexOfChild(parent, newFirst)
+	if idx <= 0 {
+		return nil
+	}
+	return append([]*Node(nil), parent.Children[:idx]...)
+}
+
+// droppedByNextSibling lists what relinkNextSibling(node, newNext) would
+// discard: everything after node (for a clear), or the siblings between
+// node and newNext.
+func droppedByNextSibling(node, newNext *Node) []*Node {
+	parent := node.Parent
+	if parent == nil {
+		return nil
+	}
+	idx := indexOfChild(parent, node)
+	if idx < 0 {
+		return nil
+	}
+	if newNext == nil {
+		return append([]*Node(nil), parent.Children[idx+1:]...)
+	}
+	newIdx := indexOfChild(parent, newNext)
+	if newIdx <= idx+1 {
+		return nil
+	}
+	return append([]*Node(nil), parent.Children[idx+1:newIdx]...)
 }

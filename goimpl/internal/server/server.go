@@ -15,6 +15,8 @@ import (
 
 	"github.com/quic-go/quic-go"
 
+	"github.com/shashi/snmp-ng/goimpl/internal/authz"
+	"github.com/shashi/snmp-ng/goimpl/internal/certs"
 	"github.com/shashi/snmp-ng/goimpl/internal/query"
 	"github.com/shashi/snmp-ng/goimpl/internal/reliability"
 	"github.com/shashi/snmp-ng/goimpl/internal/tree"
@@ -36,6 +38,11 @@ type Server struct {
 	// on a real network path the discovered limit is far larger than this
 	// repo's small demo tree would ever exceed.
 	MaxDatagramSizeOverride int
+
+	// Policy is the access-control policy applied to every session. nil is
+	// open mode: identity-based rules don't apply, but the built-in session
+	// protections (see internal/authz) always do.
+	Policy *authz.Policy
 }
 
 func New() *Server {
@@ -64,6 +71,13 @@ type Session struct {
 	ID     string
 	server *Server
 	conn   *quic.Conn
+
+	// identity is the peer's verified certificate CommonName, or
+	// "anonymous" if it presented none (only possible when the server
+	// doesn't require client certificates). auth answers every access check
+	// made on this session's behalf.
+	identity string
+	auth     authz.Checker
 
 	newNodesPath     *tree.Node
 	errorsPath       *tree.Node
@@ -136,8 +150,14 @@ func (sess *Session) setMaxDatagramSize(n int) {
 
 func (s *Server) newSession(conn *quic.Conn) *Session {
 	id := randomSessionID()
+	identity := certs.PeerIdentity(conn.ConnectionState().TLS)
+	if identity == "" {
+		identity = "anonymous"
+	}
 	sess := &Session{
 		ID:               id,
+		identity:         identity,
+		auth:             s.Policy.NewChecker(identity, id),
 		server:           s,
 		conn:             conn,
 		respCache:        make(map[int64]cachedResponse),
@@ -169,7 +189,7 @@ func (sess *Session) run(ctx context.Context) {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	log.Printf("[server] session %s: connected (%s)", sess.ID, sess.conn.RemoteAddr())
+	log.Printf("[server] session %s: connected (%s) as %q", sess.ID, sess.conn.RemoteAddr(), sess.identity)
 	defer log.Printf("[server] session %s: closed", sess.ID)
 
 	go sess.sender.RunRetransmitLoop(ctx)
@@ -403,6 +423,7 @@ const (
 	errInvalidDelete     = "InvalidDelete"
 	errInvalidCreate     = "InvalidCreate"
 	errInvalidQuery      = "InvalidQuery"
+	errPermissionDenied  = "PermissionDenied"
 	errInternal          = "InternalError"
 )
 
@@ -431,6 +452,15 @@ func (sess *Session) respondError(requestSeq int64, code, message string) {
 	})
 }
 
+// errCode picks the error node code for err: PermissionDenied if an access
+// check refused it, otherwise the operation's own generic code.
+func errCode(err error, generic string) string {
+	if errors.Is(err, tree.ErrPermissionDenied) {
+		return errPermissionDenied
+	}
+	return generic
+}
+
 // --- Get -----------------------------------------------------------------
 
 func (sess *Session) handleGet(g *wire.Get) {
@@ -438,7 +468,7 @@ func (sess *Session) handleGet(g *wire.Get) {
 		sess.respondError(g.SequenceNumber, errInvalidExpression, "Get.target must be an absolute expression")
 		return
 	}
-	flat, resumeIndex, base, err := sess.server.Tree.GetFull(g.Target.Absolute)
+	flat, resumeIndex, base, err := sess.server.Tree.GetFullAs(g.Target.Absolute, sess.auth)
 	if err != nil {
 		sess.respondError(g.SequenceNumber, errInvalidExpression, err.Error())
 		return
@@ -449,7 +479,7 @@ func (sess *Session) handleGet(g *wire.Get) {
 // --- Set -------------------------------------------------------------------
 
 func (sess *Session) handleSet(s *wire.Set) {
-	touched, err := sess.server.Tree.Set(s, sess.newNodesPath)
+	touched, err := sess.server.Tree.SetAs(s, sess.newNodesPath, sess.auth)
 	if err != nil {
 		// Set's edits can each fail for a different reason (bad expression,
 		// wrong match count, a relink conflict between two edits), so
@@ -457,7 +487,7 @@ func (sess *Session) handleSet(s *wire.Set) {
 		// way handleGet's errInvalidExpression can be -- errInvalidSet plus
 		// the message (which names the offending target) is what a caller
 		// actually needs.
-		sess.respondError(s.SequenceNumber, errInvalidSet, err.Error())
+		sess.respondError(s.SequenceNumber, errCode(err, errInvalidSet), err.Error())
 		return
 	}
 	sess.reapCancelledQueries()
@@ -470,9 +500,9 @@ func (sess *Session) handleSet(s *wire.Set) {
 // --- Delete ------------------------------------------------------------------
 
 func (sess *Session) handleDelete(d *wire.Delete) {
-	deleted, err := sess.server.Tree.Delete(d.Targets)
+	deleted, err := sess.server.Tree.DeleteAs(d.Targets, sess.auth)
 	if err != nil {
-		sess.respondError(d.SequenceNumber, errInvalidDelete, err.Error())
+		sess.respondError(d.SequenceNumber, errCode(err, errInvalidDelete), err.Error())
 		return
 	}
 	sess.reapCancelledQueries()
@@ -493,7 +523,7 @@ func (sess *Session) handleCreate(c *wire.Create) {
 	if c.Parent != nil {
 		parentExpr = *c.Parent
 	}
-	n, err := sess.server.Tree.CreateStaged(sess.newNodesPath, parentExpr, c.Key, value)
+	n, err := sess.server.Tree.CreateStagedAs(sess.newNodesPath, parentExpr, c.Key, value, sess.auth)
 	if err != nil {
 		sess.respondError(c.SequenceNumber, errInvalidCreate, err.Error())
 		return
@@ -537,7 +567,7 @@ func (sess *Session) handleQuery(ctx context.Context, q *wire.Query) {
 	resultsNode := sess.server.Tree.AppendUnder(sess.queryResultsPath,
 		fmt.Sprintf("Query-SequenceNumber=%d", q.SequenceNumber), wire.NoValue())
 
-	runner := query.NewRunner(*q, treeSampler{sess.server.Tree}, sessionResultSink{sess: sess, resultsNode: resultsNode})
+	runner := query.NewRunner(*q, treeSampler{tree: sess.server.Tree, auth: sess.auth}, sessionResultSink{sess: sess, resultsNode: resultsNode})
 
 	sess.queriesMu.Lock()
 	sess.activeQueries[q.SequenceNumber] = runner
@@ -592,10 +622,13 @@ func (sess *Session) reapCancelledQueries() {
 	}
 }
 
-type treeSampler struct{ tree *tree.Tree }
+type treeSampler struct {
+	tree *tree.Tree
+	auth authz.Checker
+}
 
 func (s treeSampler) Sample(expression string) ([]query.Sample, error) {
-	nodes, err := s.tree.FindAll(expression)
+	nodes, err := s.tree.FindAllAs(expression, s.auth)
 	if err != nil {
 		return nil, err
 	}

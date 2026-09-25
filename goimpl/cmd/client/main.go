@@ -7,6 +7,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"net"
 	"os"
 	"strconv"
 	"sync"
@@ -36,6 +37,10 @@ const (
 
 func main() {
 	addr := flag.String("addr", "127.0.0.1:8515", "server address")
+	caFile := flag.String("ca", "", "CA certificate (PEM) to verify the server against; omit to skip verification (demo only)")
+	certFile := flag.String("cert", "", "client certificate (PEM) to present; its CommonName is this client's identity")
+	keyFile := flag.String("key", "", "client private key (PEM)")
+	serverName := flag.String("server-name", "", "name expected in the server certificate (default: the host part of -addr)")
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "usage: %s [-addr host:port] <command> [args...]\n\n", os.Args[0])
 		fmt.Fprintf(os.Stderr, "commands:\n")
@@ -60,7 +65,21 @@ func main() {
 	// request's own requestTimeout, and query's own --watch duration.
 	ctx := context.Background()
 
-	conn, err := quic.DialAddr(ctx, *addr, certs.ClientConfig(), &quic.Config{
+	tlsConf := certs.ClientConfig()
+	if *caFile != "" {
+		name := *serverName
+		if name == "" {
+			name, _, _ = net.SplitHostPort(*addr)
+		}
+		var terr error
+		if tlsConf, terr = certs.ClientTLSConfig(*certFile, *keyFile, *caFile, name); terr != nil {
+			log.Fatalf("loading TLS config: %v", terr)
+		}
+	} else if *certFile != "" {
+		log.Fatalf("-cert needs -ca: presenting a certificate to a server that isn't verified would be pointless")
+	}
+
+	conn, err := quic.DialAddr(ctx, *addr, tlsConf, &quic.Config{
 		EnableDatagrams: true,
 		MaxIdleTimeout:  maxIdleTimeout,
 		KeepAlivePeriod: keepAlivePeriod,
@@ -208,6 +227,12 @@ func (c *client) sendAndWait(ctx context.Context, seq int64, msg wire.Message) (
 		return r, nil
 	case <-time.After(requestTimeout):
 		return nil, fmt.Errorf("timeout waiting for response (seq %d)", seq)
+	case <-c.conn.Context().Done():
+		// e.g. the server rejected our certificate: under TLS 1.3 the
+		// handshake finishes on the client before the server validates the
+		// client's certificate, so the rejection only shows up as the
+		// connection being closed -- surface that instead of a bare timeout.
+		return nil, fmt.Errorf("connection closed: %w", context.Cause(c.conn.Context()))
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	}

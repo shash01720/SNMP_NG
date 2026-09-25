@@ -3,6 +3,7 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"flag"
 	"fmt"
 	"log"
@@ -12,6 +13,7 @@ import (
 
 	"github.com/quic-go/quic-go"
 
+	"github.com/shashi/snmp-ng/goimpl/internal/authz"
 	"github.com/shashi/snmp-ng/goimpl/internal/certs"
 	"github.com/shashi/snmp-ng/goimpl/internal/server"
 	"github.com/shashi/snmp-ng/goimpl/internal/wire"
@@ -44,14 +46,34 @@ func main() {
 		"override the auto-discovered per-datagram payload budget (bytes); "+
 			"mainly for testing/demoing truncation, since a real path's limit "+
 			"is far larger than this demo's small tree would ever exceed")
+	tlsCert := flag.String("tls-cert", "", "server certificate (PEM); with -tls-key. Omit for a throwaway self-signed demo certificate")
+	tlsKey := flag.String("tls-key", "", "server private key (PEM)")
+	clientCA := flag.String("client-ca", "", "CA certificate (PEM) that client certificates must chain to; enables mutual TLS, and each client's certificate CommonName becomes its identity")
+	policyFile := flag.String("policy", "", "access-control policy (JSON, see internal/authz); omit for open mode")
 	flag.Parse()
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	tlsConf, err := certs.GenerateSelfSigned()
-	if err != nil {
-		log.Fatalf("generating TLS cert: %v", err)
+	var tlsConf *tls.Config
+	var err error
+	switch {
+	case *tlsCert != "" || *tlsKey != "":
+		tlsConf, err = certs.ServerTLSConfig(*tlsCert, *tlsKey, *clientCA)
+		if err != nil {
+			log.Fatalf("loading TLS config: %v", err)
+		}
+	case *clientCA != "":
+		log.Fatalf("-client-ca needs -tls-cert and -tls-key: a demo certificate can't be verified by clients")
+	default:
+		tlsConf, err = certs.GenerateSelfSigned()
+		if err != nil {
+			log.Fatalf("generating TLS cert: %v", err)
+		}
+		log.Printf("[server] WARNING: throwaway self-signed certificate and no client authentication; every client is %q", "anonymous")
+	}
+	if *tlsCert != "" && *clientCA == "" {
+		log.Printf("[server] WARNING: -client-ca not set, so clients are not authenticated; every client is %q", "anonymous")
 	}
 
 	ln, err := quic.ListenAddr(*addr, tlsConf, &quic.Config{
@@ -65,6 +87,14 @@ func main() {
 	defer ln.Close()
 
 	srv := server.New()
+	if *policyFile != "" {
+		if srv.Policy, err = authz.Load(*policyFile); err != nil {
+			log.Fatalf("loading policy: %v", err)
+		}
+		log.Printf("[server] access-control policy loaded from %s", *policyFile)
+	} else {
+		log.Printf("[server] no -policy: open mode (session isolation still enforced)")
+	}
 	srv.MaxDatagramSizeOverride = *maxDatagramSize
 	seedDemoData(srv)
 	seedIfMib(srv)
