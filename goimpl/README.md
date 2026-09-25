@@ -219,8 +219,8 @@ I/O.
   calls, attach it with one Set) -- but an ordinary Set targeting an
   EXISTING live node still applies immediately, not staged until some
   later commit, so there's no way to stage a batch of edits to values
-  already in the tree. There's also no explicit discard: an unattached
-  staged subtree just sits under NewNodes until the session ends.
+  already in the tree. Discarding a staged subtree is just a Delete on
+  it; left alone, it sits under NewNodes until the session ends.
 - **No real mTLS.** `internal/certs` generates a throwaway self-signed
   certificate, and the client sets `InsecureSkipVerify`. See the parent
   conversation's mTLS design discussion (TCP+TLS vs. DTLS vs. QUIC's own
