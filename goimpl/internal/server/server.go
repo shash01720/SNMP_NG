@@ -493,7 +493,7 @@ func (sess *Session) handleSet(s *wire.Set) {
 	sess.reapCancelledQueries()
 	sess.respondAndCache(s.SequenceNumber, &wire.Response{
 		InReplyTo: s.SequenceNumber,
-		Nodes:     confirmationNodes(touched),
+		Nodes:     sess.server.Tree.Snapshot(touched),
 	})
 }
 
@@ -508,7 +508,7 @@ func (sess *Session) handleDelete(d *wire.Delete) {
 	sess.reapCancelledQueries()
 	sess.respondAndCache(d.SequenceNumber, &wire.Response{
 		InReplyTo: d.SequenceNumber,
-		Nodes:     confirmationNodes(deleted),
+		Nodes:     sess.server.Tree.Snapshot(deleted),
 	})
 }
 
@@ -530,26 +530,8 @@ func (sess *Session) handleCreate(c *wire.Create) {
 	}
 	sess.respondAndCache(c.SequenceNumber, &wire.Response{
 		InReplyTo: c.SequenceNumber,
-		Nodes:     confirmationNodes([]*tree.Node{n}),
+		Nodes:     sess.server.Tree.Snapshot([]*tree.Node{n}),
 	})
-}
-
-// confirmationNodes maps tree nodes to a flat wire.Node list reporting
-// exactly what Set/Create/Delete touched. These are independent
-// confirmation entries, not a real flattened subtree walk (see
-// tree.FlattenMatches for that), so firstChild/nextSibling are always the
-// "none" sentinel.
-func confirmationNodes(nodes []*tree.Node) []wire.Node {
-	out := make([]wire.Node, len(nodes))
-	for i, n := range nodes {
-		out[i] = wire.Node{
-			Key:         n.Key,
-			Value:       n.Value,
-			FirstChild:  wire.OffsetPointer(0),
-			NextSibling: wire.OffsetPointer(0),
-		}
-	}
-	return out
 }
 
 // --- Query -----------------------------------------------------------------
@@ -632,8 +614,9 @@ func (s treeSampler) Sample(expression string) ([]query.Sample, error) {
 	if err != nil {
 		return nil, err
 	}
-	samples := make([]query.Sample, len(nodes))
-	for i, n := range nodes {
+	snap := s.tree.Snapshot(nodes)
+	samples := make([]query.Sample, len(snap))
+	for i, n := range snap {
 		samples[i] = query.Sample{Key: n.Key, Value: n.Value}
 	}
 	return samples, nil
@@ -656,17 +639,13 @@ type sessionResultSink struct {
 }
 
 func (s sessionResultSink) DeliverResults(querySeq int64, results map[string][]wire.NodeValue) error {
-	var nodes []wire.Node
+	var appended []*tree.Node
 	for key, values := range results {
 		for _, v := range values {
-			n := s.sess.server.Tree.AppendUnder(s.resultsNode, key, v)
-			nodes = append(nodes, wire.Node{
-				Key: n.Key, Value: n.Value,
-				FirstChild: wire.OffsetPointer(0), NextSibling: wire.OffsetPointer(0),
-			})
+			appended = append(appended, s.sess.server.Tree.AppendUnder(s.resultsNode, key, v))
 		}
 	}
-	return s.sess.sendBatched(querySeq, nodes)
+	return s.sess.sendBatched(querySeq, s.sess.server.Tree.Snapshot(appended))
 }
 
 // sendBatched sends `nodes` as one or more Response messages (each with

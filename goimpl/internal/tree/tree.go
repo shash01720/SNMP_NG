@@ -494,6 +494,26 @@ func (t *Tree) FindAllAs(expression string, auth authz.Checker) ([]*Node, error)
 	return evaluateAs(t.Root, segments, auth), nil
 }
 
+// Snapshot copies each node's key and value while holding the tree's read
+// lock, as independent entries whose firstChild/nextSibling are "none". A
+// *Node returned by FindAllAs, SetAs, DeleteAs or CreateStagedAs is outside
+// the lock once that call returns, so reading its fields directly would
+// race with a concurrent Set from another session.
+func (t *Tree) Snapshot(nodes []*Node) []wire.Node {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	out := make([]wire.Node, len(nodes))
+	for i, n := range nodes {
+		out[i] = wire.Node{
+			Key:         n.Key,
+			Value:       n.Value,
+			FirstChild:  wire.OffsetPointer(0),
+			NextSibling: wire.OffsetPointer(0),
+		}
+	}
+	return out
+}
+
 // IsReachable reports whether node is still part of the live tree (Root
 // itself, or a descendant of it). A node detached by Delete or by Set's
 // newFirstChild/newNextSibling/newParent keeps its own Parent field
