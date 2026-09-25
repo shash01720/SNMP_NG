@@ -68,6 +68,7 @@ your own locally if you want to re-run the script end to end.
 |---|---|
 | [node.asn](node.asn) | ASN.1 schema: the full wire protocol |
 | [CapabilityMatrix.md](CapabilityMatrix.md) | Feature comparison against SNMP, NETCONF and gNMI, with remaining gaps |
+| [DEVELOPMENT_LOG.md](DEVELOPMENT_LOG.md) | How the protocol was designed and built: decisions, measurements, dead ends and mistakes |
 | [goimpl/](goimpl/) | The Go/QUIC implementation — see its README |
 | [ifmib_dump.json](ifmib_dump.json) | Real IF-MIB capture, used as demo data |
 | [parse_ifmib_dump.py](parse_ifmib_dump.py) | Turns a raw `snmpbulkwalk` capture into `ifmib_dump.json` (MAC-anonymized) |
