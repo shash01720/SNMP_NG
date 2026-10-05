@@ -21,7 +21,8 @@ applicable to that protocol.
 | Interval telemetry | polling | RFC 8640 | ✅ SAMPLE | ✅ `Query`, `interval` mode |
 | Event-driven telemetry | ❌ | ✅ | ✅ ON_CHANGE | ✅ `Query`, `onChange` mode (baseline push, then diffed pushes) |
 | Cancel one subscription | n/a | ✅ | ✅ | ✅ delete the query's own results node (or an ancestor) |
-| Sync marker / per-update timestamps | n/a | ✅ | ✅ | ❌ no timestamps; no explicit "baseline done" marker |
+| Timestamps on pushed data | n/a | ✅ | ✅ | ⚠️ each `Query` push is a subtree rooted at its transfer timestamp (UTC, ns), also kept in session state; it is transfer time, not per-sample time, and `Get` responses carry none |
+| Explicit "baseline done" marker | n/a | ✅ | ✅ | ❌ the first `onChange` push is the baseline, but nothing says so |
 | Deletions reported to subscribers | n/a | ✅ | ✅ | ❌ `onChange` reports additions and changes only |
 | Async unsolicited notifications | ✅ TRAP/INFORM | ✅ | via ON_CHANGE | ❌ everything is triggered by a client's own standing request |
 | Reliability | ❌ (UDP) | ✅ (TCP) | ✅ | ✅ `SummaryAck` (fixed-interval retransmit, not adaptive) |
@@ -37,8 +38,9 @@ applicable to that protocol.
 1. **Async notifications.** The biggest functional hole shared by all three
    reference protocols: nothing is server-initiated independent of a
    client's own standing request.
-2. **Timestamps and a sync marker on pushes.** Cheap to add, and a telemetry
-   consumer needs both.
+2. **Per-sample timestamps, timestamps on `Get`, and a baseline marker.** Pushes
+   now carry their transfer time; a telemetry consumer still can't tell when a
+   value was actually sampled, or which push is the baseline.
 3. **Deletion reporting in `onChange`, and staged edits to existing values.**
 4. **Operating access control for real:** revocation, policy reload, an audit
    trail, and making authenticated mode the default rather than open mode.

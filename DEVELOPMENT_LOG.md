@@ -134,7 +134,7 @@ flag pointing at an error node) and typed values modelled on SNMP's SMI
 - Reliability is a protocol feature here (`SummaryAck`); classic SNMP leaves
   retries to the tooling.
 
-## Phase 4: closing gaps against SNMP, NETCONF and gNMI (Sep 24-25)
+## Phase 4: closing gaps against SNMP, NETCONF and gNMI (Sep 24 - Oct 5)
 
 A gap analysis (now [`CapabilityMatrix.md`](CapabilityMatrix.md)) drove the
 rest of the work, largest gaps first.
@@ -192,6 +192,20 @@ rest of the work, largest gaps first.
   are isolated from one another. Verified over real QUIC with real
   certificates. A client with no or a foreign certificate is refused in
   ~0.4s (the client used to report only a timeout, which was fixed).
+- **Timestamped query results.** Each `Query` transfer is now a subtree
+  rooted at its UTC timestamp (fixed-width, nanosecond, strictly increasing per
+  query), materialized under the query's results node in session state and
+  pushed to the client as that same subtree, cut with continuation pointers
+  into the materialized path when it doesn't fit a datagram. That replaced the
+  old flat batching, which needed no pointers but couldn't carry a root. It
+  gives pushes a timestamp (transfer time, not per-sample time), which is the
+  piece an OpenTelemetry-style bridge needs. Two things came out of it: a
+  push must not be cached under the query's request sequence number or it
+  replaces the registration ack a retransmitted `Query` should get (invisible
+  for `once` queries, where the push precedes the ack, so the test for it uses
+  a recurring one), and the server was answering with an empty success when
+  not even one node plus its continuation pointer fit a datagram, which reads
+  as "no match" and silently drops data -- it now sends nothing instead.
 
 ## Mistakes in the process, and what caught them
 
@@ -207,13 +221,15 @@ Recorded because the way they were caught is as useful as the fixes.
 | leaked `snmpd` MAC addresses | reading the raw capture before committing |
 | receiver keeping every sequence number, unbounded, despite the "state bounded" claim | a review comparing this log against the code |
 | query sampling and Set/Delete confirmations reading node values after the tree lock was released, racing a concurrent `Set` | the first end-to-end server test, run under `-race` |
+| a regression test for "a push must not replace the cached registration ack" that passed with the bug present (for a `once` query the ack is cached after the push, so it overwrites it anyway) | deliberately re-introducing the bug and watching the test still pass; it now uses a recurring query and fails when mutated |
+| an empty success response when not even one node plus its continuation pointer fit a datagram | a truncation test whose datagram override was smaller than the continuation pointer alone |
 
 ## Things deliberately left open
 
 See [`CapabilityMatrix.md`](CapabilityMatrix.md) for the full list. In
 priority order: server-initiated notifications (nothing is sent unless a
-client has a standing request), timestamps and a sync marker on pushes,
-deletion reporting in `onChange`, staged edits to *existing* values,
+client has a standing request), per-sample timestamps and a baseline marker
+on pushes, deletion reporting in `onChange`, staged edits to *existing* values,
 certificate revocation and policy reload, and replace, locking, schema
 validation and capability negotiation.
 

@@ -17,6 +17,7 @@ import (
 
 	"github.com/shash01720/SNMP_NG/goimpl/internal/certs"
 	"github.com/shash01720/SNMP_NG/goimpl/internal/reliability"
+	"github.com/shash01720/SNMP_NG/goimpl/internal/tree"
 	"github.com/shash01720/SNMP_NG/goimpl/internal/wire"
 )
 
@@ -317,6 +318,13 @@ func runGet(ctx context.Context, c *client, args []string) {
 func followGet(ctx context.Context, c *client, label, expression string) {
 	q := newContinuationQueue()
 	q.Add(expression)
+	followQueue(ctx, c, label, expression, q)
+}
+
+// followQueue drains q, issuing a Get per pending expression and queueing
+// every absolute pointer each response reveals. root is the expression the
+// first response is labelled as, not a continuation of anything.
+func followQueue(ctx context.Context, c *client, label, root string, q *continuationQueue) {
 	followups := 0
 
 	for {
@@ -334,7 +342,7 @@ func followGet(ctx context.Context, c *client, label, expression string) {
 		q.MarkCovered(expr, len(resp.Nodes))
 
 		batchLabel := label
-		if expr != expression {
+		if expr != root {
 			batchLabel = fmt.Sprintf("%s (continuation of %q)", label, expr)
 		}
 		printResponse(batchLabel, resp)
@@ -502,7 +510,7 @@ func runQuery(ctx context.Context, c *client, args []string) {
 	seq := c.allocSeq()
 	q.SequenceNumber = seq
 
-	var pushWg sync.WaitGroup
+	var pushWg, followWg sync.WaitGroup
 	pushWg.Add(1)
 	done := make(chan struct{})
 	c.pushMu.Lock()
@@ -510,7 +518,7 @@ func runQuery(ctx context.Context, c *client, args []string) {
 		if r.InReplyTo != seq {
 			return
 		}
-		printResponse(fmt.Sprintf("query push (seq %d)", r.SequenceNumber), r)
+		handlePush(ctx, c, &followWg, r)
 	}
 	c.pushMu.Unlock()
 	go func() {
@@ -534,7 +542,7 @@ func runQuery(ctx context.Context, c *client, args []string) {
 	if len(resp.Nodes) == 0 {
 		printResponse("query registered", resp)
 	} else {
-		printResponse(fmt.Sprintf("query push (seq %d)", resp.SequenceNumber), resp)
+		handlePush(ctx, c, &followWg, resp)
 	}
 
 	if mode.Kind == wire.CollectOnce {
@@ -544,6 +552,36 @@ func runQuery(ctx context.Context, c *client, args []string) {
 		close(done)
 	}
 	pushWg.Wait()
+	followWg.Wait()
+}
+
+// handlePush prints a Query push and, if it was truncated (each push is a
+// timestamp-rooted subtree, cut with continuation pointers just like a Get
+// result), fetches the rest in the background: this runs on the connection's
+// read loop, which must not block waiting for a reply it is itself
+// responsible for delivering.
+func handlePush(ctx context.Context, c *client, wg *sync.WaitGroup, r *wire.Response) {
+	printResponse(fmt.Sprintf("query push (seq %d)", r.SequenceNumber), r)
+
+	q := newContinuationQueue()
+	var base string
+	for _, n := range r.Nodes {
+		for _, p := range []wire.NodePointer{n.FirstChild, n.NextSibling} {
+			if p.Kind == wire.PointerAbsolute && q.Add(p.Absolute) && base == "" {
+				base, _ = tree.SplitResumeSuffix(p.Absolute)
+			}
+		}
+	}
+	if base == "" {
+		return
+	}
+	// The push itself covered the start of that subtree.
+	q.MarkCovered(base+"@0", len(r.Nodes))
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		followQueue(ctx, c, "query push", base, q)
+	}()
 }
 
 func parseAggMethod(s string) (*wire.AggregationMethod, error) {

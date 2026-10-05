@@ -682,3 +682,47 @@ func TestFitToSizeCannotFitEvenOneNode(t *testing.T) {
 		t.Fatal("expected truncated=true when there was data but none of it fit")
 	}
 }
+
+// --- AppendLeafSubtree ----------------------------------------------------
+
+func TestAppendLeafSubtreeBuildsAndFlattens(t *testing.T) {
+	tr := demoTree()
+	parent, err := tr.FindOne("/config")
+	if err != nil {
+		t.Fatal(err)
+	}
+	changed, gen := tr.ChangedSince(0)
+
+	flat := tr.AppendLeafSubtree(parent, "root", []Entry{
+		{Key: "a", Value: wire.Integer32Value(1)},
+		{Key: "b", Value: wire.Integer32Value(2)},
+	})
+
+	// root -> a -> b: the root has a firstChild and no sibling; a points at
+	// b; b ends the list.
+	if len(flat) != 3 || flat[0].Key != "root" || flat[1].Key != "a" || flat[2].Key != "b" {
+		t.Fatalf("flat = %+v", flat)
+	}
+	if flat[0].Value.Kind != wire.ValueNoValue {
+		t.Fatalf("root carries a value: %+v", flat[0].Value)
+	}
+	if flat[0].FirstChild.Offset != 1 || flat[0].NextSibling.Offset != 0 ||
+		flat[1].NextSibling.Offset != 1 || flat[2].NextSibling.Offset != 0 {
+		t.Fatalf("pointers wrong: %+v", flat)
+	}
+
+	// It's really in the tree, as the parent's last child.
+	if got, _ := tr.Get("/config/root/b=2"); len(got) != 1 {
+		t.Fatalf("subtree not reachable under /config: %+v", got)
+	}
+	if last := parent.Children[len(parent.Children)-1]; last.Key != "root" {
+		t.Fatalf("last child of /config is %q, want root", last.Key)
+	}
+
+	// And watchers were told.
+	select {
+	case <-changed:
+	default:
+		t.Fatalf("no change notification after generation %d", gen)
+	}
+}

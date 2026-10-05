@@ -494,6 +494,32 @@ func (t *Tree) FindAllAs(expression string, auth authz.Checker) ([]*Node, error)
 	return evaluateAs(t.Root, segments, auth), nil
 }
 
+// Entry is one (key, value) leaf for AppendLeafSubtree.
+type Entry struct {
+	Key   string
+	Value wire.NodeValue
+}
+
+// AppendLeafSubtree appends a new node rootKey (no value) as parent's last
+// child, with each entry as one of its leaf children in the order given, and
+// returns that new subtree flattened pre-order with offset pointers -- the
+// same shape Get returns, with the root at index 0 and no nextSibling.
+// Building and flattening happen under one lock, so the result reflects
+// exactly what was inserted even if another session mutates the tree
+// meanwhile.
+func (t *Tree) AppendLeafSubtree(parent *Node, rootKey string, entries []Entry) []wire.Node {
+	t.mu.Lock()
+	root := &Node{Key: rootKey, Value: wire.NoValue()}
+	AppendChild(parent, root)
+	for _, e := range entries {
+		AppendChild(root, &Node{Key: e.Key, Value: e.Value})
+	}
+	flat := flattenSubtree(root)
+	t.mu.Unlock()
+	t.notifyChanged()
+	return flat
+}
+
 // Snapshot copies each node's key and value while holding the tree's read
 // lock, as independent entries whose firstChild/nextSibling are "none". A
 // *Node returned by FindAllAs, SetAs, DeleteAs or CreateStagedAs is outside

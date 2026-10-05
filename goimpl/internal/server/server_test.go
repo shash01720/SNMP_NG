@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"crypto/tls"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -16,6 +17,7 @@ import (
 	"github.com/shash01720/SNMP_NG/goimpl/internal/authz"
 	"github.com/shash01720/SNMP_NG/goimpl/internal/certs"
 	"github.com/shash01720/SNMP_NG/goimpl/internal/reliability"
+	"github.com/shash01720/SNMP_NG/goimpl/internal/tree"
 	"github.com/shash01720/SNMP_NG/goimpl/internal/wire"
 )
 
@@ -241,6 +243,54 @@ func values(r *wire.Response) []string {
 	return out
 }
 
+// pushShape checks that r is an untruncated Query push: a subtree rooted at a
+// fixed-format timestamp node (no value, firstChild at the first leaf, no
+// sibling), and returns that timestamp and the leaves as key=value strings.
+func pushShape(t *testing.T, r *wire.Response) (time.Time, []string) {
+	t.Helper()
+	if len(r.Nodes) < 2 {
+		t.Fatalf("push has %d node(s), want a timestamp root plus leaves: %v", len(r.Nodes), values(r))
+	}
+	root := r.Nodes[0]
+	ts, err := time.Parse(timestampKeyFormat, root.Key)
+	if err != nil {
+		t.Fatalf("push root key %q is not a timestamp: %v", root.Key, err)
+	}
+	if root.Value.Kind != wire.ValueNoValue {
+		t.Fatalf("timestamp root carries a value: %+v", root.Value)
+	}
+	if root.FirstChild.Kind != wire.PointerOffset || root.FirstChild.Offset != 1 {
+		t.Fatalf("timestamp root firstChild = %+v, want offset 1", root.FirstChild)
+	}
+	if root.NextSibling.Kind != wire.PointerOffset || root.NextSibling.Offset != 0 {
+		t.Fatalf("timestamp root nextSibling = %+v, want none", root.NextSibling)
+	}
+	return ts, values(&wire.Response{Nodes: r.Nodes[1:]})
+}
+
+// queryPush starts a query and returns its pushes (nodes only) in arrival
+// order, discarding the empty registration ack. n is how many pushes to wait
+// for; the ack is consumed alongside them.
+func queryPush(t *testing.T, c *testClient, q *wire.Query, n int) (seq int64, pushes []*wire.Response) {
+	t.Helper()
+	seq = c.allocSeq()
+	q.SequenceNumber = seq
+	c.send(seq, wire.Message{Kind: wire.MsgQuery, Query: q})
+	for acks := 0; len(pushes) < n || acks < 1; {
+		r := mustOK(t, c.next(seq))
+		if len(r.Nodes) == 0 {
+			acks++
+		} else {
+			pushes = append(pushes, r)
+		}
+	}
+	return seq, pushes
+}
+
+func escapedResultsPath(c *testClient, qseq int64) string {
+	return c.sessionPath() + `/QueryResults/Query-SequenceNumber\=` + strconv.FormatInt(qseq, 10)
+}
+
 func valueString(v wire.NodeValue) string {
 	switch v.Kind {
 	case wire.ValueOctetString:
@@ -359,7 +409,7 @@ func TestOnChangeQueryAndCancelByDelete(t *testing.T) {
 	var baseline []string
 	for i := 0; i < 2; i++ {
 		if r := mustOK(t, c.next(qseq)); len(r.Nodes) > 0 {
-			baseline = values(r)
+			_, baseline = pushShape(t, r)
 		}
 	}
 	if strings.Join(baseline, ",") != "timeout=30" {
@@ -367,7 +417,7 @@ func TestOnChangeQueryAndCancelByDelete(t *testing.T) {
 	}
 
 	mustOK(t, c.setValue("/config/timeout", wire.Integer32Value(99)))
-	if got := values(mustOK(t, c.next(qseq))); strings.Join(got, ",") != "timeout=99" {
+	if _, got := pushShape(t, mustOK(t, c.next(qseq))); strings.Join(got, ",") != "timeout=99" {
 		t.Fatalf("change push: %v", got)
 	}
 
@@ -378,6 +428,212 @@ func TestOnChangeQueryAndCancelByDelete(t *testing.T) {
 	mustOK(t, c.del(c.sessionPath()+"/QueryResults/Query-SequenceNumber.*"))
 	mustOK(t, c.setValue("/config/timeout", wire.Integer32Value(7)))
 	c.expectNone(qseq, 1500*time.Millisecond)
+}
+
+// Each transfer is a subtree rooted at its timestamp, and that exact subtree
+// is also materialized under the query's results node in the session.
+func TestQueryPushIsTimestampedSubtreeAlsoInSessionState(t *testing.T) {
+	srv := New()
+	seed(srv)
+	c := dial(t, startServer(t, srv, nil), nil)
+
+	qseq, pushes := queryPush(t, c, &wire.Query{
+		NodeExpression: "/config/.*",
+		CollectionMode: wire.OnceMode(),
+	}, 1)
+	ts, leaves := pushShape(t, pushes[0])
+	// Leaves are ordered by key, not by the (random) map order they were
+	// collected in.
+	if got := strings.Join(leaves, ","); got != "retries=3,timeout=30" {
+		t.Fatalf("leaves = %s", got)
+	}
+
+	stored := mustOK(t, c.get(escapedResultsPath(c, qseq)+"/"+ts.Format(timestampKeyFormat)))
+	if strings.Join(values(stored), ",") != strings.Join(values(pushes[0]), ",") {
+		t.Fatalf("session state %v differs from what was pushed %v", values(stored), values(pushes[0]))
+	}
+}
+
+// Successive pushes get strictly increasing timestamps and accumulate as
+// sibling subtrees under the one results node.
+func TestQueryPushTimestampsIncreaseAndAccumulate(t *testing.T) {
+	srv := New()
+	seed(srv)
+	c := dial(t, startServer(t, srv, nil), nil)
+
+	qseq, first := queryPush(t, c, &wire.Query{
+		NodeExpression:   "/config/timeout",
+		CollectionMode:   wire.OnChangeMode(),
+		TransferInterval: 1,
+	}, 1)
+	ts1, _ := pushShape(t, first[0])
+
+	mustOK(t, c.setValue("/config/timeout", wire.Integer32Value(99)))
+	ts2, leaves := pushShape(t, mustOK(t, c.next(qseq)))
+	if !ts2.After(ts1) {
+		t.Fatalf("second push %v is not after first %v", ts2, ts1)
+	}
+	if strings.Join(leaves, ",") != "timeout=99" {
+		t.Fatalf("second push leaves = %v", leaves)
+	}
+
+	// Both transfers are in session state: two timestamp roots, one leaf each.
+	all := mustOK(t, c.get(escapedResultsPath(c, qseq)+"/.*"))
+	if len(all.Nodes) != 4 {
+		t.Fatalf("results node holds %d nodes, want 4 (two timestamp subtrees of 2): %v", len(all.Nodes), values(all))
+	}
+	if all.Nodes[0].Key != ts1.Format(timestampKeyFormat) || all.Nodes[2].Key != ts2.Format(timestampKeyFormat) {
+		t.Fatalf("results node roots are %q and %q, want the two push timestamps", all.Nodes[0].Key, all.Nodes[2].Key)
+	}
+}
+
+// A push too big for one datagram is cut with a continuation pointer into
+// its materialized path, which a client Gets to reassemble it.
+func TestQueryPushTruncatedAndReassembledByContinuation(t *testing.T) {
+	srv := New()
+	seed(srv)
+	config, err := srv.Tree.FindOne("/config")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 20; i++ {
+		srv.Tree.AppendUnder(config, fmt.Sprintf("k%02d", i), wire.Integer32Value(int32(i)))
+	}
+	// Roomy enough for a timestamp root, a few leaves and the continuation
+	// pointer (a full path into session state, ~110 bytes), far short of all
+	// 22 leaves.
+	srv.MaxDatagramSizeOverride = 400
+	c := dial(t, startServer(t, srv, nil), nil)
+
+	q := &wire.Query{NodeExpression: "/config/.*", CollectionMode: wire.OnceMode()}
+	_, pushes := queryPush(t, c, q, 1)
+
+	got := map[int]wire.Node{}
+	for i, n := range pushes[0].Nodes {
+		got[i] = n
+	}
+	var pending []string
+	collect := func(r *wire.Response) {
+		for _, n := range r.Nodes {
+			for _, p := range []wire.NodePointer{n.FirstChild, n.NextSibling} {
+				if p.Kind == wire.PointerAbsolute {
+					pending = append(pending, p.Absolute)
+				}
+			}
+		}
+	}
+	collect(pushes[0])
+	if len(pending) == 0 {
+		t.Fatalf("the whole %d-node push fit in one 400-byte datagram; the test needs a bigger result", len(pushes[0].Nodes))
+	}
+	for steps := 0; len(pending) > 0 && steps < 20; steps++ {
+		expr := pending[0]
+		pending = pending[1:]
+		base, idx := tree.SplitResumeSuffix(expr)
+		if !strings.Contains(base, "/QueryResults/Query-SequenceNumber") {
+			t.Fatalf("continuation %q doesn't point into the query's results", expr)
+		}
+		if _, done := got[idx]; done {
+			continue
+		}
+		r := mustOK(t, c.get(expr))
+		for i, n := range r.Nodes {
+			got[idx+i] = n
+		}
+		collect(r)
+	}
+
+	// timestamp root + 20 filler leaves + retries + timeout, leaves by key.
+	want := []string{"k00", "k01", "k02", "k03", "k04", "k05", "k06", "k07", "k08", "k09",
+		"k10", "k11", "k12", "k13", "k14", "k15", "k16", "k17", "k18", "k19", "retries", "timeout"}
+	if len(got) != 1+len(want) {
+		t.Fatalf("reassembled %d nodes, want %d", len(got), 1+len(want))
+	}
+	if _, err := time.Parse(timestampKeyFormat, got[0].Key); err != nil {
+		t.Fatalf("reassembled root %q is not a timestamp", got[0].Key)
+	}
+	for i, k := range want {
+		if n, ok := got[i+1]; !ok || n.Key != k {
+			t.Fatalf("reassembled index %d = %q, want %q", i+1, n.Key, k)
+		}
+	}
+}
+
+// A recurring query's pushes share inReplyTo with its registration ack, and
+// arrive after it is cached; caching a push would replace that ack, so a
+// retransmitted Query request would be answered with stale data instead.
+// (A ONCE query can't show this: its push is sent before the ack is cached,
+// so the ack overwrites it regardless.)
+func TestQueryPushDoesNotReplaceCachedRegistrationAck(t *testing.T) {
+	srv := New()
+	seed(srv)
+	c := dial(t, startServer(t, srv, nil), nil)
+
+	q := &wire.Query{NodeExpression: "/config/timeout", CollectionMode: wire.OnChangeMode(), TransferInterval: 1}
+	qseq, _ := queryPush(t, c, q, 1)
+	mustOK(t, c.setValue("/config/timeout", wire.Integer32Value(99)))
+	mustOK(t, c.next(qseq)) // the change push, sent after registration was cached
+
+	// Resend the Query as a retransmit would (bypassing the reliability
+	// layer's own dedup): the answer must still be the empty ack.
+	if err := c.conn.SendDatagram(wire.MarshalMessage(wire.Message{Kind: wire.MsgQuery, Query: q})); err != nil {
+		t.Fatal(err)
+	}
+	if again := mustOK(t, c.next(qseq)); len(again.Nodes) != 0 {
+		t.Fatalf("a retransmitted Query got %d node(s) back (%v), want its empty ack", len(again.Nodes), values(again))
+	}
+}
+
+// When not even one node plus its continuation pointer fits, the server must
+// not answer with an empty success: that reads as "no match" and silently
+// drops the data.
+func TestGetThatCannotFitSendsNothingInsteadOfAnEmptySuccess(t *testing.T) {
+	srv := New()
+	seed(srv)
+	srv.MaxDatagramSizeOverride = 20
+	c := dial(t, startServer(t, srv, nil), nil)
+
+	seq := c.allocSeq()
+	c.send(seq, wire.Message{Kind: wire.MsgGet, Get: &wire.Get{SequenceNumber: seq, Target: wire.AbsolutePointer("/users")}})
+	c.expectNone(seq, time.Second)
+}
+
+func TestNextTimestampIsStrictlyIncreasing(t *testing.T) {
+	base := time.Now().Add(time.Hour)
+	s := &sessionResultSink{lastTS: base}
+	a, b := s.nextTimestamp(), s.nextTimestamp()
+	if !a.Equal(base.Add(time.Nanosecond)) || !b.After(a) {
+		t.Fatalf("clock behind the last timestamp must still yield increasing keys: %v then %v", a, b)
+	}
+	if a.Format(timestampKeyFormat) == b.Format(timestampKeyFormat) {
+		t.Fatal("distinct timestamps formatted to the same key")
+	}
+}
+
+func TestTimestampKeyIsFixedWidthAndExpressionSafe(t *testing.T) {
+	for _, ts := range []time.Time{time.Unix(0, 0), time.Date(2026, 10, 5, 13, 0, 19, 5, time.UTC), time.Now()} {
+		k := ts.UTC().Format(timestampKeyFormat)
+		if len(k) != len(timestampKeyFormat) {
+			t.Errorf("%q has length %d, want %d", k, len(k), len(timestampKeyFormat))
+		}
+		if strings.ContainsAny(k, `/=@\`) {
+			t.Errorf("%q contains a character the expression grammar treats specially", k)
+		}
+	}
+}
+
+func TestSortedEntriesOrdersByKeyKeepingValueOrder(t *testing.T) {
+	got := sortedEntries(map[string][]wire.NodeValue{
+		"b": {wire.Integer32Value(1), wire.Integer32Value(2)},
+		"a": {wire.Integer32Value(3)},
+	})
+	var order []string
+	for _, e := range got {
+		order = append(order, e.Key+"="+valueString(e.Value))
+	}
+	if strings.Join(order, ",") != "a=3,b=1,b=2" {
+		t.Fatalf("got %v", order)
+	}
 }
 
 func TestGetTruncationContinuation(t *testing.T) {

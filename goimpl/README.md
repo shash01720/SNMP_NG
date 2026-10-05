@@ -100,6 +100,14 @@ go run ./cmd/client query --collection 1 --agg-interval 3 --agg-method mean --tr
 #   go run ./cmd/client set --value 99 "/config/timeout"
 go run ./cmd/client query --on-change --transfer 1 --watch 15s "/config/timeout"
 
+# Every transfer a Query makes is a subtree rooted at its timestamp
+# (UTC, nanosecond, fixed width), with the sampled values as its children.
+# That same subtree is both pushed to you and kept under the query's own
+# node in session state; one too big for a datagram is cut with
+# continuation pointers the client follows automatically, like a Get:
+go run ./cmd/client query --collection 0 --transfer 0 "/config/.*"
+go run ./cmd/client query --collection 0 --transfer 0 "/interfaces/.*"   # 460 leaves, fetched in ~14 round trips
+
 # Per-query cancellation: no dedicated message -- every Query gets its own
 # results subcontainer under QueryResults (see SESSION PATHS in node.asn),
 # and deleting THAT node stops the query, the same as if the session had
@@ -322,6 +330,13 @@ later changes.
   hook, and the CID isn't stable across a connection's lifetime anyway
   (it rotates on path migration), so a server-generated id fills the same
   role more robustly.
+- **Query timestamps are transfer time, and history is unbounded.** A push's
+  timestamp is when the server assembled the transfer, not when each value
+  was sampled (a recurring query may have collected a value anywhere in the
+  interval before it), and `Get` responses carry no timestamp at all. Every
+  transfer also stays in session state under the query's node until the
+  query is cancelled or the session ends, so a long-lived fast query grows
+  its session's tree without bound; there is no retention limit yet.
 - **`onChange` doesn't report deletions.** If a matched node stops
   existing (e.g. via `Delete`), its last known value simply stops
   updating -- there's no tombstone/removal concept in `QueryResults`,

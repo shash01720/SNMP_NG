@@ -238,11 +238,13 @@ CollectionMode ::= CHOICE {
 --   aggregationMethod     required iff aggregationInterval is present.
 --   transferInterval      how often (seconds) accumulated results (raw
 --                         samples, or aggregation outputs) are
---                         materialized as nodes under this session's own
+--                         materialized as a timestamp-rooted subtree
+--                         under this query's own node in this session's
 --                         "/Sessions/Connection-ID=<session-id>/QueryResults"
 --                         subtree and pushed to the client as a
---                         Response (see SESSION PATHS, below). Required
---                         (> 0) unless collectionMode is `once`.
+--                         Response carrying that same subtree (see
+--                         SESSION PATHS, below). Required (> 0) unless
+--                         collectionMode is `once`.
 
 Query ::= SEQUENCE {
     sequenceNumber       INTEGER,
@@ -344,6 +346,31 @@ NodeTreeMessage ::= CHOICE {
 -- results:
 --
 --     .../QueryResults/Query-SequenceNumber=<query's own sequenceNumber>
+--
+-- Each transfer (each time accumulated results are pushed, including the
+-- single one of a `once` query) adds one subtree to that node, rooted at a
+-- node whose key is the transfer's timestamp:
+--
+--     .../Query-SequenceNumber=<n>/2026-10-05T13:04:49.091716000Z
+--         <sampled key>   value
+--         <sampled key>   value   (a key sampled more than once repeats)
+--         ...
+--
+-- The timestamp is the server's UTC clock when the transfer was assembled,
+-- always formatted "YYYY-MM-DDTHH:MM:SS.nnnnnnnnnZ" (fixed width, so keys
+-- sort in time order), and strictly later than the query's previous one.
+-- It is the time of the transfer, not of each sample: a recurring query
+-- may have collected the values anywhere in the interval before it. The
+-- root has no value; the leaves are ordered by key, and values for the
+-- same key keep their collection order.
+--
+-- The pushed Response carries exactly that subtree, flattened the same way
+-- as a Get result (root first, firstChild/nextSibling offsets). A subtree
+-- too big for one datagram is cut like a Get result is, with absolute
+-- continuation pointers into the materialized path above
+-- (".../<timestamp>@<index>"), which the client fetches with ordinary Gets.
+-- Because the subtree stays in session state, a client that loses a push
+-- can also read it back from there, until it is deleted.
 --
 -- Deleting that node (an ordinary Delete targeting it, or a broader
 -- Delete/Set that detaches it or an ancestor of it) cancels the query;

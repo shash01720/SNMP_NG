@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"sort"
 	"sync"
 	"time"
 
@@ -365,7 +366,11 @@ func (sess *Session) cacheResponse(requestSeq int64, resp *wire.Response) {
 // discovered limit is also cached on the session so later sends in the
 // same session skip straight to fitting; see setMaxDatagramSize for why
 // that caching is skipped when an override is set.
-func (sess *Session) sendFittedNodes(requestSeq int64, flat []wire.Node, resumeIndex int, baseExpression string) {
+// cache says whether to remember the response for answering a retransmitted
+// request (respCache). A Query's pushes pass false: they share inReplyTo
+// with the query's registration ack, and caching one would replace the ack
+// a retransmitted Query request is supposed to get back.
+func (sess *Session) sendFittedNodes(requestSeq int64, flat []wire.Node, resumeIndex int, baseExpression string, cache bool) {
 	txSeq := sess.allocSeq()
 	build := func(nodes []wire.Node) *wire.Response {
 		return &wire.Response{SequenceNumber: txSeq, InReplyTo: requestSeq, Nodes: nodes}
@@ -377,6 +382,15 @@ func (sess *Session) sendFittedNodes(requestSeq int64, flat []wire.Node, resumeI
 	nodes := flat[resumeIndex:]
 	if cached := sess.getMaxDatagramSize(); cached > 0 && measure(nodes) > cached {
 		fitted, _ := tree.FitToSize(flat, resumeIndex, baseExpression, cached, measure)
+		if len(fitted) == 0 {
+			// Not even one node plus a continuation pointer fits. Sending
+			// the empty window would look to the client like "no match" --
+			// silently dropped data -- so send nothing, as the
+			// DatagramTooLargeError path below does.
+			log.Printf("[server] session %s: cannot fit even one node within max datagram size %d for request seq %d",
+				sess.ID, cached, requestSeq)
+			return
+		}
 		nodes = fitted
 	}
 
@@ -386,7 +400,9 @@ func (sess *Session) sendFittedNodes(requestSeq int64, flat []wire.Node, resumeI
 
 		err := sess.sender.Send(txSeq, payload)
 		if err == nil {
-			sess.cacheResponse(requestSeq, resp)
+			if cache {
+				sess.cacheResponse(requestSeq, resp)
+			}
 			return
 		}
 
@@ -473,7 +489,7 @@ func (sess *Session) handleGet(g *wire.Get) {
 		sess.respondError(g.SequenceNumber, errInvalidExpression, err.Error())
 		return
 	}
-	sess.sendFittedNodes(g.SequenceNumber, flat, resumeIndex, base)
+	sess.sendFittedNodes(g.SequenceNumber, flat, resumeIndex, base, true)
 }
 
 // --- Set -------------------------------------------------------------------
@@ -549,7 +565,11 @@ func (sess *Session) handleQuery(ctx context.Context, q *wire.Query) {
 	resultsNode := sess.server.Tree.AppendUnder(sess.queryResultsPath,
 		fmt.Sprintf("Query-SequenceNumber=%d", q.SequenceNumber), wire.NoValue())
 
-	runner := query.NewRunner(*q, treeSampler{tree: sess.server.Tree, auth: sess.auth}, sessionResultSink{sess: sess, resultsNode: resultsNode})
+	runner := query.NewRunner(*q, treeSampler{tree: sess.server.Tree, auth: sess.auth}, &sessionResultSink{
+		sess:        sess,
+		resultsNode: resultsNode,
+		resultsPath: fmt.Sprintf("/Sessions/Connection-ID\\=%s/QueryResults/Query-SequenceNumber\\=%d", sess.ID, q.SequenceNumber),
+	})
 
 	sess.queriesMu.Lock()
 	sess.activeQueries[q.SequenceNumber] = runner
@@ -628,88 +648,66 @@ func (s treeSampler) ChangedSince(since uint64) (<-chan struct{}, uint64) {
 	return s.tree.ChangedSince(since)
 }
 
-// sessionResultSink delivers one query's results under its own
-// resultsNode (see handleQuery), not the session's shared QueryResults
-// directly -- that per-query scoping is what lets Delete target one
-// query's results (and thereby cancel it) without disturbing any other
-// active query in the same session.
+// sessionResultSink delivers one query's results. Each transfer is
+// materialized as a new subtree under the query's own resultsNode, rooted at
+// a node keyed by the transfer's timestamp with the results as its leaf
+// children, and that same subtree is what is pushed to the client (see
+// node.asn's SESSION PATHS docs). Scoping it under resultsNode is what lets
+// Delete target one query's results, and thereby cancel it, without
+// disturbing any other active query in the session.
 type sessionResultSink struct {
 	sess        *Session
 	resultsNode *tree.Node
+	resultsPath string // expression for resultsNode, for continuation pointers
+
+	mu     sync.Mutex
+	lastTS time.Time
 }
 
-func (s sessionResultSink) DeliverResults(querySeq int64, results map[string][]wire.NodeValue) error {
-	var appended []*tree.Node
-	for key, values := range results {
-		for _, v := range values {
-			appended = append(appended, s.sess.server.Tree.AppendUnder(s.resultsNode, key, v))
+// timestampKeyFormat is fixed-width, UTC and nanosecond-precise, so keys sort
+// lexicographically in time order and contain nothing the expression grammar
+// treats specially ("/", "=", "@" or "\").
+const timestampKeyFormat = "2006-01-02T15:04:05.000000000Z"
+
+// nextTimestamp returns the current time, forced strictly later than the
+// previous one this sink handed out so two transfers can never share a key:
+// the continuation expression for a truncated push names its subtree by that
+// key, and must not match two of them.
+func (s *sessionResultSink) nextTimestamp() time.Time {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	ts := time.Now().UTC()
+	if !ts.After(s.lastTS) {
+		ts = s.lastTS.Add(time.Nanosecond)
+	}
+	s.lastTS = ts
+	return ts
+}
+
+// sortedEntries flattens results into tree entries ordered by key (a map
+// iterates in random order), keeping each key's values in collection order.
+func sortedEntries(results map[string][]wire.NodeValue) []tree.Entry {
+	keys := make([]string, 0, len(results))
+	for k := range results {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	var entries []tree.Entry
+	for _, k := range keys {
+		for _, v := range results[k] {
+			entries = append(entries, tree.Entry{Key: k, Value: v})
 		}
 	}
-	return s.sess.sendBatched(querySeq, s.sess.server.Tree.Snapshot(appended))
+	return entries
 }
 
-// sendBatched sends `nodes` as one or more Response messages (each with
-// its own fresh sequenceNumber, all sharing inReplyTo), splitting across
-// multiple datagrams if they don't all fit in one. Unlike sendFittedNodes
-// (used for Get, where a node's offset pointers encode real relationships
-// to other nodes that must be preserved via a continuation pointer),
-// Query's pushed nodes are independent results with no internal pointer
-// relationships to preserve (see DeliverResults, above, which always
-// gives each one a trivial "none" firstChild/nextSibling), so this only
-// needs to split the list into datagram-sized batches -- no offset
-// rewriting.
-func (sess *Session) sendBatched(inReplyTo int64, nodes []wire.Node) error {
-	if len(nodes) == 0 {
+func (s *sessionResultSink) DeliverResults(querySeq int64, results map[string][]wire.NodeValue) error {
+	entries := sortedEntries(results)
+	if len(entries) == 0 {
 		return nil // nothing to push this transfer
 	}
-	for len(nodes) > 0 {
-		txSeq := sess.allocSeq()
-		build := func(n []wire.Node) *wire.Response {
-			return &wire.Response{SequenceNumber: txSeq, InReplyTo: inReplyTo, Nodes: n}
-		}
-		measure := func(n []wire.Node) int {
-			return len(wire.MarshalMessage(wire.Message{Kind: wire.MsgResponse, Response: build(n)}))
-		}
-
-		batch := nodes
-		if cached := sess.getMaxDatagramSize(); cached > 0 && measure(batch) > cached {
-			batch = fitBatch(nodes, cached, measure)
-		}
-
-		sent := false
-		for attempt := 0; attempt < 2; attempt++ {
-			payload := wire.MarshalMessage(wire.Message{Kind: wire.MsgResponse, Response: build(batch)})
-			err := sess.sender.Send(txSeq, payload)
-			if err == nil {
-				sent = true
-				break
-			}
-			var tooLarge *quic.DatagramTooLargeError
-			if !errors.As(err, &tooLarge) {
-				return err
-			}
-			sess.sender.Cancel(txSeq)
-			sess.setMaxDatagramSize(int(tooLarge.MaxDatagramPayloadSize))
-			batch = fitBatch(nodes, int(tooLarge.MaxDatagramPayloadSize), measure)
-			if len(batch) == 0 {
-				return fmt.Errorf("cannot fit even one node within max datagram size %d", tooLarge.MaxDatagramPayloadSize)
-			}
-		}
-		if !sent {
-			return fmt.Errorf("gave up fitting a batch after repeated DatagramTooLargeError")
-		}
-		nodes = nodes[len(batch):]
-	}
-	return nil
-}
-
-// fitBatch returns the largest prefix of nodes whose batch fits within
-// maxSize, per measure.
-func fitBatch(nodes []wire.Node, maxSize int, measure func([]wire.Node) int) []wire.Node {
-	for n := len(nodes); n > 0; n-- {
-		if measure(nodes[:n]) <= maxSize {
-			return nodes[:n]
-		}
-	}
+	key := s.nextTimestamp().Format(timestampKeyFormat)
+	flat := s.sess.server.Tree.AppendLeafSubtree(s.resultsNode, key, entries)
+	s.sess.sendFittedNodes(querySeq, flat, 0, s.resultsPath+"/"+key, false)
 	return nil
 }
