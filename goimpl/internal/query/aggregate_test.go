@@ -267,6 +267,54 @@ func TestRunnerOnChangeDeliversOnRealChange(t *testing.T) {
 	}
 }
 
+// Many nodes can share a key (one ifDescr per interface); change detection
+// must tell them apart. Before samples carried an identity, it compared each
+// against whichever same-keyed node was sampled just before it, so an
+// unchanged query re-reported its matches at every wake-up.
+func TestRunnerOnChangeDistinguishesNodesSharingAKey(t *testing.T) {
+	two := func(a, b int32) []Sample {
+		return []Sample{
+			{ID: "/m/h0/cpu", Key: "cpu", Value: wire.Integer32Value(a)},
+			{ID: "/m/h1/cpu", Key: "cpu", Value: wire.Integer32Value(b)},
+		}
+	}
+	sampler := newFakeChangeSampler(two(10, 20))
+	sink := &fakeSink{}
+	q := wire.Query{SequenceNumber: 1, NodeExpression: "/m/.*/cpu", CollectionMode: wire.OnChangeMode(), TransferInterval: 1}
+	r := NewRunner(q, sampler, sink)
+	r.Start(context.Background())
+	defer r.Stop()
+
+	waitForCalls(t, sink, 1) // baseline: both nodes
+	sink.mu.Lock()
+	if got := sink.delivered["cpu"]; len(got) != 2 {
+		sink.mu.Unlock()
+		t.Fatalf("baseline delivered %d values for key cpu, want both nodes' (2)", len(got))
+	}
+	sink.mu.Unlock()
+
+	// Same values again (an unrelated mutation woke the query): nothing new,
+	// even though the two nodes' values differ from each other.
+	sampler.push(two(10, 20))
+	time.Sleep(100 * time.Millisecond)
+	sink.mu.Lock()
+	calls := sink.calls
+	sink.mu.Unlock()
+	if calls != 1 {
+		t.Fatalf("an unchanged re-sample caused %d delivery(ies), want none beyond the baseline", calls-1)
+	}
+
+	// Only the node that actually changed is delivered.
+	sampler.push(two(10, 25))
+	waitForCalls(t, sink, 2)
+	sink.mu.Lock()
+	got := sink.delivered["cpu"]
+	sink.mu.Unlock()
+	if len(got) != 1 || got[0].Integer32 != 25 {
+		t.Fatalf("second delivery = %+v, want only the changed node's value (25)", got)
+	}
+}
+
 func TestValidateQuery(t *testing.T) {
 	agg := wire.AggregationMethod{Kind: wire.AggMean}
 	interval := int64(60)

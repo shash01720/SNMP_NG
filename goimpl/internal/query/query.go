@@ -12,6 +12,12 @@ import (
 // Sample is one collected (key, value) observation -- deliberately decoupled
 // from the tree package's Node type, so query has no dependency on it.
 type Sample struct {
+	// ID identifies the sampled node uniquely, so onChange can tell "this
+	// node changed" from "a different node that shares its Key was sampled
+	// next": many nodes commonly share a key (one ifDescr per interface).
+	// Samplers without a better identity may leave it empty, in which case
+	// Key is used -- correct only if keys are unique among the matches.
+	ID    string
 	Key   string
 	Value wire.NodeValue
 }
@@ -81,7 +87,7 @@ type Runner struct {
 	mu         sync.Mutex
 	collected  map[string][]wire.NodeValue // since the last aggregation (or transfer, if no aggregation)
 	pending    map[string][]wire.NodeValue // aggregated/raw results accumulated since the last transfer
-	lastValues map[string]wire.NodeValue   // onChange only: last value reported per key, for diffing
+	lastValues map[string]wire.NodeValue   // onChange only: last value reported per sampled node (Sample.ID), for diffing
 }
 
 func NewRunner(q wire.Query, sampler Sampler, sink ResultSink) *Runner {
@@ -228,10 +234,14 @@ func (r *Runner) collectChanges() {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	for _, s := range samples {
-		if prev, seen := r.lastValues[s.Key]; seen && prev.Equal(s.Value) {
+		id := s.ID
+		if id == "" {
+			id = s.Key
+		}
+		if prev, seen := r.lastValues[id]; seen && prev.Equal(s.Value) {
 			continue
 		}
-		r.lastValues[s.Key] = s.Value
+		r.lastValues[id] = s.Value
 		r.collected[s.Key] = append(r.collected[s.Key], s.Value)
 	}
 }

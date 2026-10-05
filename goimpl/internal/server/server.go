@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"log"
 	"sort"
+	"strconv"
 	"sync"
 	"time"
 
@@ -92,6 +93,8 @@ type Session struct {
 
 	respCacheMu sync.Mutex
 	respCache   map[int64]cachedResponse // keyed by the request's own sequenceNumber
+	respOrder   []respRecord             // insertion order of respCache, for expiry
+	respHead    int                      // first live record in respOrder
 
 	queriesMu     sync.Mutex
 	activeQueries map[int64]*query.Runner
@@ -334,19 +337,46 @@ func (sess *Session) respondAndCache(requestSeq int64, resp *wire.Response) {
 	sess.cacheResponse(requestSeq, resp)
 }
 
-// cacheResponse records resp and sweeps any entry older than respCacheTTL.
-// Sweeping on every insert (rather than on a separate ticker) needs no
-// extra goroutine and keeps the map small in practice, since it only ever
-// holds entries from roughly the last respCacheTTL of traffic.
+// cacheResponse records resp for answering a retransmitted request, and
+// expires entries older than respCacheTTL.
 func (sess *Session) cacheResponse(requestSeq int64, resp *wire.Response) {
+	sess.cacheResponseAt(requestSeq, resp, time.Now())
+}
+
+// respRecord is one insertion, in insertion order, so expiry only ever looks
+// at the oldest entries instead of scanning the whole map.
+type respRecord struct {
+	seq int64
+	at  time.Time
+}
+
+// cacheResponseAt is cacheResponse with the clock supplied. Expiry is a FIFO
+// over insertion order: an entry is dropped from the map only if it is still
+// the one that insertion put there (a sequence number cached twice keeps its
+// newer entry), and the queue is compacted once most of it is spent. The
+// first version scanned the entire map on every insert, which is O(entries
+// held) per request -- about 84,000 at 2,800 requests/s with a 30 s TTL --
+// and was the largest CPU cost in a load test.
+func (sess *Session) cacheResponseAt(requestSeq int64, resp *wire.Response, now time.Time) {
 	sess.respCacheMu.Lock()
 	defer sess.respCacheMu.Unlock()
-	now := time.Now()
 	sess.respCache[requestSeq] = cachedResponse{resp: resp, at: now}
-	for seq, c := range sess.respCache {
-		if now.Sub(c.at) > respCacheTTL {
-			delete(sess.respCache, seq)
+	sess.respOrder = append(sess.respOrder, respRecord{requestSeq, now})
+	for sess.respHead < len(sess.respOrder) {
+		old := sess.respOrder[sess.respHead]
+		if now.Sub(old.at) <= respCacheTTL {
+			break
 		}
+		if c, ok := sess.respCache[old.seq]; ok && c.at.Equal(old.at) {
+			delete(sess.respCache, old.seq)
+		}
+		sess.respOrder[sess.respHead] = respRecord{}
+		sess.respHead++
+	}
+	if sess.respHead >= 1024 && sess.respHead*2 >= len(sess.respOrder) {
+		n := copy(sess.respOrder, sess.respOrder[sess.respHead:])
+		sess.respOrder = sess.respOrder[:n]
+		sess.respHead = 0
 	}
 }
 
@@ -630,14 +660,13 @@ type treeSampler struct {
 }
 
 func (s treeSampler) Sample(expression string) ([]query.Sample, error) {
-	nodes, err := s.tree.FindAllAs(expression, s.auth)
+	sampled, err := s.tree.SampleAs(expression, s.auth)
 	if err != nil {
 		return nil, err
 	}
-	snap := s.tree.Snapshot(nodes)
-	samples := make([]query.Sample, len(snap))
-	for i, n := range snap {
-		samples[i] = query.Sample{Key: n.Key, Value: n.Value}
+	samples := make([]query.Sample, len(sampled))
+	for i, n := range sampled {
+		samples[i] = query.Sample{ID: strconv.FormatUint(n.ID, 10), Key: n.Key, Value: n.Value}
 	}
 	return samples, nil
 }

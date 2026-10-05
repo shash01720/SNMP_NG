@@ -726,3 +726,35 @@ func TestAppendLeafSubtreeBuildsAndFlattens(t *testing.T) {
 		t.Fatalf("no change notification after generation %d", gen)
 	}
 }
+
+// Sampled nodes need an identity that survives their value changing and
+// distinguishes siblings sharing a key -- even when the whole key path is the
+// same, as for the two users in demoTree (both /users/user).
+func TestSampleAsIDsAreUniqueAndStable(t *testing.T) {
+	tr := demoTree()
+	first, err := tr.SampleAs("/users/user", nil)
+	if err != nil || len(first) != 3 {
+		t.Fatalf("got %+v, err %v", first, err)
+	}
+	seen := map[uint64]bool{}
+	for _, s := range first {
+		if s.ID == 0 || seen[s.ID] {
+			t.Fatalf("IDs must be nonzero and unique: %+v", first)
+		}
+		seen[s.ID] = true
+	}
+
+	v := wire.StringValue("zed")
+	if _, err := tr.Set(&wire.Set{Edits: []wire.SetEdit{{Target: "/users/user=alice", NewValue: &v}}}, nil); err != nil {
+		t.Fatal(err)
+	}
+	second, _ := tr.SampleAs("/users/user", nil)
+	for i := range first {
+		if second[i].ID != first[i].ID {
+			t.Fatalf("node %d changed identity when its value changed: %d -> %d", i, first[i].ID, second[i].ID)
+		}
+	}
+	if string(second[0].Value.OctetString) != "zed" {
+		t.Fatalf("sample didn't see the new value: %+v", second[0])
+	}
+}

@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"github.com/shash01720/SNMP_NG/goimpl/internal/authz"
 	"github.com/shash01720/SNMP_NG/goimpl/internal/wire"
@@ -26,7 +27,15 @@ type Node struct {
 	Value    wire.NodeValue
 	Children []*Node
 	Parent   *Node
+
+	// id identifies this node for as long as it exists, assigned when it is
+	// first attached (see AppendChild). Neither Key nor even the full key
+	// path can: siblings may share a key (that is how arrays are
+	// represented), so two distinct nodes can have the same path.
+	id uint64
 }
+
+var nextNodeID atomic.Uint64
 
 // Tree is a Node tree guarded by a single mutex -- simple and sufficient
 // for this reference implementation's traffic volumes; a real deployment
@@ -83,6 +92,7 @@ func (t *Tree) notifyChanged() {
 
 // AppendChild adds `child` as parent's last child, fixing up Parent.
 func AppendChild(parent, child *Node) {
+	child.id = nextNodeID.Add(1)
 	child.Parent = parent
 	parent.Children = append(parent.Children, child)
 }
@@ -429,15 +439,59 @@ func (t *Tree) GetFullAs(expression string, auth authz.Checker) (flat []wire.Nod
 // Offsets are deltas (target index - current index), so they stay valid wherever a
 // contiguous run of them ends up, but a node included in the window can
 // point past it -- exactly the case this rewrites.
+//
+// The window size is found by binary search, not by trying every size from
+// the full remainder downward: that was O(N^2) in node-marshals per call
+// (about 100 ms for a 1,000-node result, 1.8 s for 4,000), and every
+// continuation fetch of a big result repeats it. Search assumes a window's
+// size grows with its length, which holds up to dips (an absolute
+// continuation pointer is longer than the in-window offset it replaces, so
+// a longer window can be shorter in bytes than a shorter one). A bounded
+// scan past the search result (dipSpan) absorbs those; if a wider dip ever
+// slipped through, the result is still a window that fits, just not the
+// very largest, and the continuation pointer covers the rest.
+// dipSpan is how many window sizes past the binary-search result FitToSize
+// also tries; see its doc comment.
+const dipSpan = 32
+
 func FitToSize(flat []wire.Node, resumeIndex int, baseExpression string, maxSize int, measure func([]wire.Node) int) (window []wire.Node, truncated bool) {
 	windowTotal := len(flat) - resumeIndex
-	for n := windowTotal; n > 0; n-- {
-		candidate := fixupWindow(flat, resumeIndex, n, baseExpression)
-		if measure(candidate) <= maxSize {
-			return candidate, n < windowTotal
+	if windowTotal <= 0 {
+		return nil, false
+	}
+	try := func(n int) ([]wire.Node, bool) {
+		w := fixupWindow(flat, resumeIndex, n, baseExpression)
+		return w, measure(w) <= maxSize
+	}
+	if w, ok := try(windowTotal); ok {
+		return w, false
+	}
+
+	// Invariant: lo fits (0 means "nothing known to fit"); the answer is in
+	// [lo, hi]. The full remainder is already known not to fit.
+	lo, hi := 0, windowTotal-1
+	var best []wire.Node
+	for lo < hi {
+		mid := (lo + hi + 1) / 2
+		if w, ok := try(mid); ok {
+			lo, best = mid, w
+		} else {
+			hi = mid - 1
 		}
 	}
-	return nil, windowTotal > 0
+	// Size dips at node boundaries (a window ending where several ancestors'
+	// pointers cross carries several long continuation pointers), so rather
+	// than trust the first failure, look a bounded span further for a longer
+	// window that does fit.
+	for n := lo + 1; n <= lo+dipSpan && n < windowTotal; n++ {
+		if w, ok := try(n); ok {
+			lo, best = n, w
+		}
+	}
+	if lo == 0 {
+		return nil, true
+	}
+	return best, true
 }
 
 // fixupWindow copies flat[resumeIndex:resumeIndex+n] and rewrites any
@@ -492,6 +546,35 @@ func (t *Tree) FindAllAs(expression string, auth authz.Checker) ([]*Node, error)
 		return nil, err
 	}
 	return evaluateAs(t.Root, segments, auth), nil
+}
+
+// Sampled is one node matched by SampleAs. ID is unique to the node and
+// stable while it exists, which Key is not (one ifDescr per interface) and
+// neither is the key path (the two users in a demo tree are both
+// /users/user); Key and Value are what a query reports.
+type Sampled struct {
+	ID    uint64
+	Key   string
+	Value wire.NodeValue
+}
+
+// SampleAs resolves expression on behalf of an identity (as FindAllAs) and
+// copies each match's path, key and value, all under one read lock, so a
+// concurrent Set or Delete can't change what was matched between finding the
+// nodes and reading them.
+func (t *Tree) SampleAs(expression string, auth authz.Checker) ([]Sampled, error) {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	segments, err := ParseExpression(expression)
+	if err != nil {
+		return nil, err
+	}
+	nodes := evaluateAs(t.Root, segments, auth)
+	out := make([]Sampled, len(nodes))
+	for i, n := range nodes {
+		out[i] = Sampled{ID: n.id, Key: n.Key, Value: n.Value}
+	}
+	return out, nil
 }
 
 // Entry is one (key, value) leaf for AppendLeafSubtree.

@@ -636,6 +636,33 @@ func TestSortedEntriesOrdersByKeyKeepingValueOrder(t *testing.T) {
 	}
 }
 
+// A query matching several nodes that share a key (here both users' "user")
+// must not re-report them on every unrelated mutation, and must deliver only
+// the one that really changed.
+func TestOnChangeQueryOverNodesSharingAKey(t *testing.T) {
+	srv := New()
+	seed(srv)
+	c := dial(t, startServer(t, srv, nil), nil)
+
+	qseq, pushes := queryPush(t, c, &wire.Query{
+		NodeExpression:   "/users/user",
+		CollectionMode:   wire.OnChangeMode(),
+		TransferInterval: 1,
+	}, 1)
+	if _, got := pushShape(t, pushes[0]); strings.Join(got, ",") != "user=alice,user=bob" {
+		t.Fatalf("baseline leaves = %v, want both users", got)
+	}
+
+	// Wakes the query, changes nothing it watches.
+	mustOK(t, c.setValue("/config/timeout", wire.Integer32Value(99)))
+	c.expectNone(qseq, 1500*time.Millisecond)
+
+	mustOK(t, c.setValue("/users/user=alice", wire.StringValue("carol")))
+	if _, got := pushShape(t, mustOK(t, c.next(qseq))); strings.Join(got, ",") != "user=carol" {
+		t.Fatalf("change push = %v, want only the changed user", got)
+	}
+}
+
 func TestGetTruncationContinuation(t *testing.T) {
 	srv := New()
 	seed(srv)
@@ -726,3 +753,83 @@ func TestPolicyEnforcedByCertificateIdentity(t *testing.T) {
 }
 
 func ptr[T any](v T) *T { return &v }
+
+// --- response cache expiry --------------------------------------------------
+
+func newCacheOnlySession() *Session {
+	return &Session{respCache: map[int64]cachedResponse{}}
+}
+
+func TestCacheExpiresEntriesOlderThanTTLInInsertionOrder(t *testing.T) {
+	s := newCacheOnlySession()
+	t0 := time.Unix(1000, 0)
+	resp := &wire.Response{}
+	s.cacheResponseAt(1, resp, t0)
+	s.cacheResponseAt(2, resp, t0.Add(10*time.Second))
+	s.cacheResponseAt(3, resp, t0.Add(respCacheTTL).Add(time.Second)) // entry 1 is now older than the TTL
+
+	if _, ok := s.respCache[1]; ok {
+		t.Error("entry 1 outlived the TTL")
+	}
+	if _, ok := s.respCache[2]; !ok {
+		t.Error("entry 2 is within the TTL and must be kept")
+	}
+	if _, ok := s.respCache[3]; !ok {
+		t.Error("the entry just inserted must be kept")
+	}
+}
+
+// A sequence number cached a second time keeps its newer entry when the
+// older insertion's record expires.
+func TestCacheKeepsNewerEntryWhenSameSeqIsRecached(t *testing.T) {
+	s := newCacheOnlySession()
+	t0 := time.Unix(1000, 0)
+	old, newer := &wire.Response{SequenceNumber: 1}, &wire.Response{SequenceNumber: 2}
+	s.cacheResponseAt(7, old, t0)
+	s.cacheResponseAt(7, newer, t0.Add(20*time.Second))
+	s.cacheResponseAt(8, &wire.Response{}, t0.Add(respCacheTTL).Add(time.Second)) // expires the t0 record only
+
+	got, ok := s.respCache[7]
+	if !ok || got.resp != newer {
+		t.Fatalf("seq 7 = %+v (present=%v), want the newer entry kept", got, ok)
+	}
+}
+
+// Expiry must not cost time proportional to how many entries are held.
+func TestCacheInsertIsConstantTimeWithManyEntriesHeld(t *testing.T) {
+	s := newCacheOnlySession()
+	t0 := time.Unix(1000, 0)
+	const held = 20000
+	for i := 0; i < held; i++ { // all within the TTL: nothing expires
+		s.cacheResponseAt(int64(i), &wire.Response{}, t0.Add(time.Duration(i)*time.Microsecond))
+	}
+	start := time.Now()
+	const more = 2000
+	for i := 0; i < more; i++ {
+		s.cacheResponseAt(int64(held+i), &wire.Response{}, t0.Add(time.Second).Add(time.Duration(i)*time.Microsecond))
+	}
+	// Scanning ~20k entries per insert costs ~0.5-1 s for these 2,000; the
+	// FIFO does them in about a millisecond.
+	if d := time.Since(start); d > 150*time.Millisecond {
+		t.Fatalf("%d inserts into a cache of %d took %v", more, held, d)
+	}
+	if len(s.respCache) != held+more {
+		t.Fatalf("cache holds %d, want %d", len(s.respCache), held+more)
+	}
+}
+
+// The queue is compacted as it is consumed, so a long-lived session's
+// bookkeeping stays proportional to what it holds.
+func TestCacheQueueIsCompacted(t *testing.T) {
+	s := newCacheOnlySession()
+	t0 := time.Unix(1000, 0)
+	for i := 0; i < 5000; i++ {
+		s.cacheResponseAt(int64(i), &wire.Response{}, t0.Add(time.Duration(i)*time.Minute)) // each expires its predecessor
+	}
+	if len(s.respCache) != 1 {
+		t.Fatalf("cache holds %d, want 1", len(s.respCache))
+	}
+	if len(s.respOrder) > 2048 {
+		t.Fatalf("order queue holds %d records for a cache of 1", len(s.respOrder))
+	}
+}
