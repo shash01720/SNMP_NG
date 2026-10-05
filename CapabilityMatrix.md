@@ -31,6 +31,8 @@ applicable to that protocol.
 | Per-identity authorization | VACM | NACM | interceptor-level | ✅ per-identity read/write/delete path rules, deny by default; unreadable nodes are absent, not "forbidden"; sessions isolated from each other |
 | Revocation, policy reload, audit trail | varies | varies | varies | ❌ no CRL/OCSP, policy loaded once at startup, no audit log |
 | Server-side aggregation | ❌ | ❌ | ❌ | ✅ min/max/mean/stdDev/percentile in `Query` |
+| Identity of a pushed value | n/a | ✅ | ✅ | ❌ a `Query` leaf carries only the node's own key, so values from many nodes sharing a key (one `ifDescr` per interface, one metric per host) can't be told apart |
+| Throughput as a collector | n/a | n/a | n/a | ⚠️ measured in [`goimpl/LOADTEST.md`](goimpl/LOADTEST.md): ~6-10x the CPU of the OpenTelemetry Collector per data point, and not sustaining 70k points/s with a subscriber; part implementation, part protocol (25 points per request) |
 | Value types | full SMI | YANG | typed | ⚠️ SNMP-inspired subset; no IpAddress, OID or Opaque; no counter-wrap-aware rates |
 
 ## Remaining gaps, in priority order
@@ -38,11 +40,14 @@ applicable to that protocol.
 1. **Async notifications.** The biggest functional hole shared by all three
    reference protocols: nothing is server-initiated independent of a
    client's own standing request.
-2. **Per-sample timestamps, timestamps on `Get`, and a baseline marker.** Pushes
+2. **Query results that identify their source node.** A pushed value says
+   `m0042=5` but not which host's `m0042`. Any multi-node query is ambiguous
+   until the push carries the path (or mirrors the matched tree's shape).
+3. **Per-sample timestamps, timestamps on `Get`, and a baseline marker.** Pushes
    now carry their transfer time; a telemetry consumer still can't tell when a
    value was actually sampled, or which push is the baseline.
-3. **Deletion reporting in `onChange`, and staged edits to existing values.**
-4. **Operating access control for real:** revocation, policy reload, an audit
+4. **Deletion reporting in `onChange`, and staged edits to existing values.**
+5. **Operating access control for real:** revocation, policy reload, an audit
    trail, and making authenticated mode the default rather than open mode.
-5. **Replace, locking, schema validation, capability negotiation.** Larger
+6. **Replace, locking, schema validation, capability negotiation.** Larger
    lifts, lower urgency.

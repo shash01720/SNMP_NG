@@ -41,6 +41,7 @@ need. See `../DEVELOPMENT_LOG.md` for the reasoning in more detail.
 | `internal/certs` | TLS setup: a small CA/leaf-certificate toolkit for mutual TLS (a client certificate's CommonName is its identity), plus the throwaway self-signed certificate used when no certificates are configured |
 | `internal/authz` | Access-control policy: per-identity read/write/delete path patterns, a global read-only list, and the built-in `/Sessions` rules (see "Authentication and access control") |
 | `cmd/pki` | Creates a CA and issues server and client certificates |
+| `cmd/loadtest` | Load generator that drives a real server as an ingest-and-forward node and reports CPU and memory; results against the OpenTelemetry Collector are in [`LOADTEST.md`](LOADTEST.md) |
 | `cmd/server`, `cmd/client` | CLI binaries -- `cmd/server` also embeds and seeds a real IF-MIB dataset, see below |
 
 ## Running the demo

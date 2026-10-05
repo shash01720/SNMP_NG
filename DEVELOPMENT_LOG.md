@@ -206,6 +206,21 @@ rest of the work, largest gaps first.
   a recurring one), and the server was answering with an empty success when
   not even one node plus its continuation pointer fit a datagram, which reads
   as "no match" and silently drops data -- it now sends nothing instead.
+- **Load test against the OpenTelemetry Collector.** `cmd/loadtest` drives a
+  real server as an ingest-and-forward node and samples its CPU and memory;
+  [`goimpl/LOADTEST.md`](goimpl/LOADTEST.md) compares it with the Collector's
+  own testbed at equal data-point rates (the testbed's "10kDPS" is really
+  ~70,000 points/s: it counts metrics, 7 points each). Result: NodeTree needs
+  roughly 6-10x the CPU when only ingesting, ~30x with a subscriber, and can't
+  sustain 70k points/s with one, partly implementation and partly protocol (a
+  request must fit one datagram, so 25 points per request against 700). It
+  also found three defects, each now fixed with a regression test: `onChange`
+  keyed change detection on a node's key, so ten hosts' same-named metric
+  looked like one value changing and the server pushed forever; fitting a push
+  into datagrams was quadratic (103 ms for 1,000 nodes, 1.76 s for 4,000);
+  and expiring the response cache scanned the whole map on every insert. And
+  it surfaced a gap in the result model that the fixes don't close: a pushed
+  value doesn't say which node it came from.
 
 ## Mistakes in the process, and what caught them
 
@@ -222,6 +237,8 @@ Recorded because the way they were caught is as useful as the fixes.
 | receiver keeping every sequence number, unbounded, despite the "state bounded" claim | a review comparing this log against the code |
 | query sampling and Set/Delete confirmations reading node values after the tree lock was released, racing a concurrent `Set` | the first end-to-end server test, run under `-race` |
 | a regression test for "a push must not replace the cached registration ack" that passed with the bug present (for a `once` query the ack is cached after the push, so it overwrites it anyway) | deliberately re-introducing the bug and watching the test still pass; it now uses a recurring query and fails when mutated |
+| a node's key path used as its identity for change detection | an end-to-end test over a tree whose siblings repeat a key (the demo's two users are both `/users/user`) |
+| a regression test for the cache-expiry cost that would have passed with the cost present | confirming it fails (565 ms vs about 1 ms) with the full scan put back |
 | an empty success response when not even one node plus its continuation pointer fit a datagram | a truncation test whose datagram override was smaller than the continuation pointer alone |
 
 ## Things deliberately left open
